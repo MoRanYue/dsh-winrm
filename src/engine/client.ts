@@ -1,17 +1,24 @@
 /**
  * WinRM transport bridge.
  *
- * This Windows host has pywinrm 0.5.0 available, and its mature requests/NTLM
- * stack successfully executes WinRM against 192.168.71.13 where the Node
- * winrm-client implementation fails. The bridge sends credentials through
- * stdin (not process arguments), preserves stdout/stderr as base64, and keeps
- * the DSH engine API unchanged.
+ * Runs each PowerShell payload over a native Node.js WinRM client
+ * (winrm-client) — no Python/pywinrm subprocess. The script rides the
+ * UTF-8 base64 envelope (marker + base64 of UTF-8 output) so Chinese and
+ * any codepage output survives the WinRM transport losslessly; the envelope
+ * is base64-encoded with `-EncodedCommand`, keeping the command line a
+ * single ASCII-safe line that WinRS/cmd.exe cannot mangle.
+ *
+ * Auth is chosen per attempt (HTTPS: Basic first, then NTLM; HTTP: NTLM
+ * first, then Basic) with fallback, so a host that only enables one scheme
+ * still connects. Credentials are passed to the library in-process — they
+ * never appear in a child-process argument list.
  */
 
-import { spawn } from 'node:child_process'
+import { Command, Shell } from 'winrm-client'
 import type { WinHostEntry } from '../protocol.ts'
-import { parseEnvelope, psFileSize, psReadChunk, psWriteChunk, winrmPowerShellScript } from '../powershell.ts'
+import { parseEnvelope, powershellCommandLine, psFileSize, psReadChunk, psWriteChunk, stripClixml, winrmPowerShellScript } from '../powershell.ts'
 
+/** Connection parameters for one target (transport-agnostic projection of a host entry). */
 export interface WinRMParams {
   host: string
   port: number
@@ -22,104 +29,154 @@ export interface WinRMParams {
   rejectUnauthorized?: boolean
 }
 
-interface BridgeResult {
-  ok: boolean
-  exitCode?: number
-  stdout?: string
-  stderr?: string
-  error?: string
-}
+/** winrm-client auth schemes (mirrors its `AuthMethod`). */
+type WinrmAuth = 'basic' | 'ntlm'
 
-const PYTHON_BRIDGE = String.raw`import sys,json,base64,winrm
-try:
-    req=json.loads(sys.stdin.read())
-    scheme='https' if req.get('useHttps') else 'http'
-    endpoint=f"{scheme}://{req['host']}:{req['port']}{req.get('path','/wsman')}"
-    timeout_ms=max(5000,int(req.get('timeoutMs',60000)))
-    timeout_sec=max(10,int((timeout_ms+999)//1000))
-    transports=['basic'] if req.get('useHttps') else ['ntlm','basic']
-    last_error=None
-    result=None
-    for transport in transports:
-        try:
-            session=winrm.Session(endpoint, auth=(req['username'],req['password']), transport=transport, server_cert_validation='ignore' if not req.get('rejectUnauthorized',True) else 'validate', operation_timeout_sec=timeout_sec, read_timeout_sec=timeout_sec+15)
-            result=session.run_ps(req['script'])
-            break
-        except Exception as exc:
-            last_error=exc
-    if result is None:
-        raise last_error or RuntimeError('all WinRM authentication modes failed')
-    print(json.dumps({'ok':True,'exitCode':int(result.status_code),'stdout':base64.b64encode(result.std_out).decode('ascii'),'stderr':base64.b64encode(result.std_err).decode('ascii')}, separators=(',',':')))
-except Exception as exc:
-    print(json.dumps({'ok':False,'error':str(exc)}, separators=(',',':')))
-`
+/** Extra wall-clock budget so connection setup does not eat the command's timeout window. */
+const SETUP_GRACE_MS = 5_000
 
-function pythonCandidates(): string[] {
-  const configured = process.env.DSH_WINRM_PYTHON?.trim()
-  return [...new Set([configured, 'python', 'py'].filter((value): value is string => Boolean(value)))]
-}
+/** Upper bound on the best-effort shell-delete round trip after a timed-out call. */
+const DELETE_TIMEOUT_MS = 10_000
 
-async function runBridge(params: WinRMParams, script: string, timeoutMs: number): Promise<BridgeResult> {
-  const request = JSON.stringify({
-    host: params.host,
-    port: params.port,
-    path: params.path,
-    username: params.username,
-    password: params.password,
-    useHttps: params.useHttps ?? false,
-    rejectUnauthorized: params.rejectUnauthorized ?? true,
-    script,
-    timeoutMs,
-  })
-
-  let lastError: unknown
-  for (const executable of pythonCandidates()) {
-    const result = await new Promise<BridgeResult | undefined>((resolve, reject) => {
-      const args = executable === 'py' ? ['-3', '-c', PYTHON_BRIDGE] : ['-c', PYTHON_BRIDGE]
-      const child = spawn(executable, args, { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, PYTHONIOENCODING: 'utf-8' } })
-      const stdout: Buffer[] = []
-      const stderr: Buffer[] = []
-      let settled = false
-      const timer = setTimeout(() => {
-        if (settled) return
-        try { child.kill() } catch { /* already gone */ }
-        settled = true
-        resolve({ ok: false, error: 'pywinrm request timed out' })
-      }, Math.max(10_000, timeoutMs + 5000))
-      child.stdout.on('data', chunk => stdout.push(Buffer.from(chunk)))
-      child.stderr.on('data', chunk => stderr.push(Buffer.from(chunk)))
-      child.on('error', error => {
-        if (settled) return
-        clearTimeout(timer)
-        settled = true
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') resolve(undefined)
-        else reject(error)
-      })
-      child.on('close', () => {
-        if (settled) return
-        clearTimeout(timer)
-        settled = true
-        const raw = Buffer.concat(stdout).toString('utf8').trim()
-        if (raw === '') {
-          resolve({ ok: false, error: Buffer.concat(stderr).toString('utf8').trim() || 'pywinrm returned no result' })
-          return
-        }
-        try {
-          resolve(JSON.parse(raw) as BridgeResult)
-        } catch {
-          resolve({ ok: false, error: raw.slice(0, 1000) })
-        }
-      })
-      child.stdin.end(request, 'utf8')
-    })
-    if (result !== undefined) return result
-    lastError = new Error(executable + ' was not found')
+/** Sentinel: the command exceeded its deadline (distinct from auth/transport errors). */
+class WinrmTimedOut extends Error {
+  constructor() {
+    super('WinRM request timed out')
+    this.name = 'WinrmTimedOut'
   }
-  return { ok: false, error: 'Python with pywinrm is required; set DSH_WINRM_PYTHON or install pywinrm. ' + String(lastError ?? '') }
 }
 
-function decode(value: string | undefined): string {
-  return value === undefined ? '' : Buffer.from(value, 'base64').toString('utf8')
+/** Small cancellable delay used to bound the shell-delete cleanup. */
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => { setTimeout(resolve, ms) })
+}
+
+/**
+ * Race a promise against a deadline; the loser's later settlement is
+ * ignored (Promise.race attaches a handler to both), so a hung WinRM call
+ * cannot surface as an unhandled rejection.
+ * @param promise - the operation to bound.
+ * @param ms - milliseconds before rejecting with {@link WinrmTimedOut}.
+ * @returns the operation result, or rejects with WinrmTimedOut on deadline.
+ */
+async function raceDeadline<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => { reject(new WinrmTimedOut()) }, ms)
+  })
+  try {
+    return await Promise.race([promise, timeout])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
+/** Build winrm-client's base params for one auth scheme. */
+function baseParams(conn: WinRMParams, authMethod: WinrmAuth) {
+  return {
+    host: conn.host,
+    port: conn.port,
+    path: conn.path,
+    username: conn.username,
+    password: conn.password,
+    authMethod,
+    useHttps: conn.useHttps ?? false,
+    rejectUnauthorized: conn.rejectUnauthorized ?? true,
+  }
+}
+
+/**
+ * One shell lifecycle: create → run the encoded script → receive until the
+ * command completes → delete. Bounded by an overall deadline; on timeout the
+ * delete is fired without blocking the caller.
+ * @param conn - connection parameters.
+ * @param envelope - the wrapped UTF-8 envelope script (already prepared).
+ * @param timeoutMs - command execution budget measured from just after Execute.
+ * @param authMethod - the auth scheme for this attempt.
+ * @returns stdout/stderr captured from the WinRS streams.
+ * @throws WinrmTimedOut when the deadline passes; other errors are auth/transport failures.
+ */
+async function attemptOnce(
+  conn: WinRMParams,
+  envelope: string,
+  timeoutMs: number,
+  authMethod: WinrmAuth,
+): Promise<{ stdout: string; stderr: string }> {
+  const base = baseParams(conn, authMethod)
+  const hardDeadline = Date.now() + timeoutMs + SETUP_GRACE_MS
+  const state = { shellId: undefined as string | undefined, timedOut: false, settled: false }
+
+  const inner = (async (): Promise<{ stdout: string; stderr: string }> => {
+    const shellId = await Shell.doCreateShell(base)
+    state.shellId = shellId
+    // The deadline can fire while the shell is still being created, in which
+    // case this attempt has already settled and its `finally` ran without a
+    // shell id: abandon the request and remove the shell here so a slow
+    // handshake cannot leak it or run the command after the timeout.
+    if (state.settled) {
+      void Shell.doDeleteShell({ ...base, shellId }).catch(() => undefined)
+      throw new WinrmTimedOut()
+    }
+    const command = powershellCommandLine(envelope)
+    const commandId = await Command.doExecuteCommand({ ...base, shellId, command })
+    const receive = { ...base, shellId, commandId }
+    const commandDeadline = Date.now() + timeoutMs
+    let stdout = ''
+    let stderr = ''
+    for (;;) {
+      if (state.settled || Date.now() >= commandDeadline) throw new WinrmTimedOut()
+      const chunk = await Command.doReceiveOutputNonBlocking(receive)
+      stdout += chunk.output
+      stderr += chunk.stderr
+      if (chunk.isComplete) return { stdout, stderr }
+    }
+  })()
+
+  try {
+    return await raceDeadline(inner, hardDeadline - Date.now())
+  } catch (error) {
+    if (error instanceof WinrmTimedOut || Date.now() >= hardDeadline) {
+      state.timedOut = true
+      throw error instanceof WinrmTimedOut ? error : new WinrmTimedOut()
+    }
+    throw error
+  } finally {
+    state.settled = true
+    const shellId = state.shellId
+    if (shellId !== undefined) {
+      const deletion = Shell.doDeleteShell({ ...base, shellId }).catch(() => undefined)
+      if (state.timedOut) void deletion
+      else await Promise.race([deletion, sleep(DELETE_TIMEOUT_MS)])
+    }
+  }
+}
+
+/**
+ * Run one envelope over WinRM, trying each auth scheme in order until one
+ * succeeds. A timeout aborts immediately (retrying auth would waste the
+ * remaining budget on a reachable-but-slow host).
+ * @param conn - connection parameters.
+ * @param envelope - the wrapped UTF-8 envelope script.
+ * @param timeoutMs - command execution budget.
+ * @returns captured stdout/stderr.
+ * @throws WinrmTimedOut on deadline; the last auth/transport error when every scheme fails.
+ */
+async function runWinrm(
+  conn: WinRMParams,
+  envelope: string,
+  timeoutMs: number,
+): Promise<{ stdout: string; stderr: string }> {
+  const candidates: WinrmAuth[] = conn.useHttps ? ['basic', 'ntlm'] : ['ntlm', 'basic']
+  let lastError: unknown
+  for (const authMethod of candidates) {
+    try {
+      return await attemptOnce(conn, envelope, timeoutMs, authMethod)
+    } catch (error) {
+      if (error instanceof WinrmTimedOut) throw error
+      lastError = error
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('all WinRM authentication methods failed')
 }
 
 export async function runScript(
@@ -129,19 +186,33 @@ export async function runScript(
 ): Promise<{ stdout: string; stderr: string; exitCode: number | null; timedOut: boolean; durationMs: number }> {
   const started = Date.now()
   const timeoutMs = options.timeoutMs ?? 60_000
-  const result = await runBridge(conn, winrmPowerShellScript(script), timeoutMs)
-  if (!result.ok) {
-    const message = result.error ?? 'pywinrm request failed'
-    if (/timed out/i.test(message)) return { stdout: '', stderr: '', exitCode: null, timedOut: true, durationMs: Date.now() - started }
-    throw new Error(message)
+  const envelope = winrmPowerShellScript(script)
+
+  let outcome: { stdout: string; stderr: string }
+  try {
+    outcome = await runWinrm(conn, envelope, timeoutMs)
+  } catch (error) {
+    if (error instanceof WinrmTimedOut) {
+      return { stdout: '', stderr: '', exitCode: null, timedOut: true, durationMs: Date.now() - started }
+    }
+    throw error
   }
-  const raw = decode(result.stdout)
-  options.onChunk?.({ output: raw, stderr: decode(result.stderr) })
+
+  const raw = outcome.stdout
   const parsed = parseEnvelope(raw)
+  // The envelope is the wrapper's completion signal, and it always prints —
+  // even for output that is empty. Its absence therefore means the script
+  // never ran to completion (a parse error, or an aborted shell), which is a
+  // failure; the raw stream is still returned as evidence.
+  const exitCode = parsed !== null ? parsed.exitCode : 1
+  // A script that reached the envelope leaves only the host's CLIXML records
+  // on stderr; an aborted one keeps its stderr untouched for diagnosis.
+  const stderr = parsed !== null ? stripClixml(outcome.stderr) : outcome.stderr
+  options.onChunk?.({ output: raw, stderr })
   return {
     stdout: parsed !== null ? parsed.text : raw,
-    stderr: decode(result.stderr),
-    exitCode: parsed !== null ? parsed.exitCode : result.exitCode ?? null,
+    stderr,
+    exitCode,
     timedOut: false,
     durationMs: Date.now() - started,
   }

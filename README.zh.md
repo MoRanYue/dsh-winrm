@@ -8,7 +8,7 @@
 | --- | --- |
 | GUI 侧边栏「Windows」入口 | 居中面板：**主机** / **控制台** / **服务** / **进程** / **传输** 五个页签 |
 | Agent 工具 | `winrm_list` `winrm_exec` `winrm_service` `winrm_process` `winrm_upload` `winrm_download` `winrm_cluster` |
-| PowerShell 控制台 | WebSocket 命令会话（每条命令通过 pywinrm 执行，输出实时返回） |
+| PowerShell 控制台 | WebSocket 命令会话（每条命令通过原生 Node WinRM 客户端执行，输出实时返回） |
 | 服务管理 | 列出 / 启动 / 停止 / 重启 / 改启动类型（自动/手动/禁用） |
 | 进程管理 | 列出（CPU/内存/路径）/ 按 PID 结束 |
 | 文件传输 | base64 分块读写，**不依赖 SMB**，任意路径可传；上传自动建目录 |
@@ -16,11 +16,12 @@
 
 ## 认证与传输
 
-- 使用 Windows 本机 `pywinrm`，优先 NTLM；受控兼容场景可回退 Basic（HTTP Basic 仅限受信内网，公网必须使用 HTTPS）
+- 使用原生 Node.js WinRM 客户端（[winrm-client](https://github.com/shide1989/winrm-client)），按传输自动选择认证：HTTPS 优先 Basic、HTTP 优先 NTLM，两者均自动回退（HTTP Basic 仅限受信内网，公网必须使用 HTTPS）
 - 本地账户可写 `Administrator`；域账户可写 `DOMAIN\\user` 或 `user@domain`
-- 本机需要可调用 Python + `pywinrm`（当前环境已安装；其他机器可执行 `python -m pip install pywinrm`）
+- 本机无需 Python —— WinRM 走纯 Node 依赖（winrm-client），随插件一起安装
 - 传输：HTTP(5985) 或 HTTPS(5986)；HTTPS 可勾选「接受自签名证书」
 - 中文输出不乱码：所有命令走 **UTF-8 base64 信封**（`-EncodedCommand` + `Out-String` 包装），绕过 WinRM 传输的代码页问题
+- 命令结果的 `stderr` 已自动剥离 PowerShell 的 CLIXML 宿主机记录；真实的进程级 stderr（如 `[Console]::Error`）原样保留
 
 ## 目标机准备（一次性）
 
@@ -41,10 +42,12 @@ powershell -ExecutionPolicy Bypass -File .\scripts\enable-winrm.ps1
 
 ## 安装
 
+> 需要 DeepSeek Harness **0.1.7-alpha.2** 或更新版本（使用 `main` / `sidebar.panellist` 插槽与 volatile 配置表单）。
+
 从 [Releases](https://github.com/andyfan1094/dsh-winrm/releases) 下载最新的 `dsh-winrm-*.tgz`，加入 profile：
 
 ```powershell
-dsh plugin --profile web add D:\downloads\dsh-winrm-0.1.4.tgz
+dsh plugin --profile web add D:\downloads\dsh-winrm-0.2.0.tgz
 ```
 
 本地开发可用 profile 链接安装：
@@ -87,7 +90,7 @@ src/
   powershell.ts       PS 片段构造器（UTF-8 信封 / 服务 / 进程 / 目录 / 分块读写）
   routes.ts           /api/dsh-winrm 路由族 + 控制台 WebSocket（loopback 围栏）
   tools.ts            7 个 winrm_* agent 工具
-  engine/client.ts    pywinrm bridge：凭据 stdin 传入、UTF-8 信封、分块传输
+  engine/client.ts    winrm-client 传输层：进程内认证（NTLM/Basic）、UTF-8 信封、分块传输
   engine/console.ts   流式 PowerShell 控制台会话
   client/             浏览器半：侧边栏入口 + 居中面板（5 页签）
 scripts/
@@ -95,7 +98,7 @@ scripts/
   postbuild.mjs       客户端产物 __ModuleLoader__ 包装
 ```
 
-传输依赖本机 Python 的 [pywinrm](https://github.com/diyan/pywinrm)（NTLM/SPNEGO）；密码通过 stdin 传给 bridge，不出现在 Python 进程参数中。
+传输依赖原生 Node.js 的 [winrm-client](https://github.com/shide1989/winrm-client)（NTLM/Basic，进程内认证）；密码只在宿主进程内使用，不出现在任何子进程命令行参数中。
 
 ## 已知限制
 
@@ -103,6 +106,7 @@ scripts/
 - WinRM 单次响应受 150KB 信封上限约束，传输按 48KB 分块，大文件较慢（每块一次往返）
 - 单命令默认 60s 超时，可传 `timeoutMs`
 - 目标机需已启用 WinRM（见上）；HTTP 明文 Basic 不应用于公网
+- 面板关闭再打开会回到「主机」页签：面板是 `main` 插槽的占用者，切回对话时卸载，页签状态不跨开关保留
 
 ---
 

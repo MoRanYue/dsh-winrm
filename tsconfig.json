@@ -1,6 +1,7 @@
 {
   // Self-contained compiler settings: types resolve from the @deepseek-ai/*
-  // npm SDK packages declared in devDependencies (official NPM SDK).
+  // npm SDK packages declared in devDependencies (official NPM SDK), plus
+  // node/winrm-client types for the host engine and transport.
   "compilerOptions": {
     "target": "ES2022",
     "module": "ESNext",
@@ -13,9 +14,10 @@
     "skipLibCheck": true,
     "isolatedModules": true,
     "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
-    "types": []
+    "types": ["node"]
   },
   "include": ["src/**/*.ts", "src/**/*.tsx"]
 }

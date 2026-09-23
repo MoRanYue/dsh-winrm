@@ -2,10 +2,10 @@
  * SMB transfer bridge.
  *
  * The WinRM base64 chunk bridge is reliable for small files but breaks for
- * large artifacts (the pywinrm/HTTP envelope rejects payloads above ~8KB).
- * This module mounts the remote host's admin share with `net use` (password
- * passed via stdin, never argv), copies whole files with node:fs, then
- * verifies the SHA-256 on both ends.
+ * large artifacts (the WinRM/HTTP envelope rejects large payloads), so whole
+ * files ride the remote admin share. This module mounts the remote host's
+ * admin share with `net use` (password passed via stdin, never argv), copies
+ * whole files with node:fs, then verifies the SHA-256 on both ends.
  */
 
 import { spawn } from 'node:child_process'

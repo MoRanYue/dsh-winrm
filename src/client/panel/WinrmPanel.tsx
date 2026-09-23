@@ -1,13 +1,13 @@
 /**
- * The WinRM operations panel shell: a header with a close control, a
- * five-tab bar, and the active tab's content. Tab state lives here; inactive
- * tabs unmount, so each tab fetches its own data on activation. The hosts
- * tab's connect action switches here to the console tab with the chosen
- * alias preselected.
+ * The WinRM operations panel shell: a header with a back control, a
+ * five-tab bar, and the active tab's content. Tab state lives here (reset to
+ * Hosts when the panel is reopened, since the keyed main slot unmounts the
+ * occupant on close); inactive tabs unmount, so each tab fetches its own data
+ * on activation. The hosts tab's connect action switches here to the console
+ * tab with the chosen alias preselected.
  */
 import { useState } from 'react'
 import type { WinrmApi } from '../api.ts'
-import type { PanelController } from './controller.ts'
 import { tt } from './helpers.ts'
 import { ConsoleTab } from './ConsoleTab.tsx'
 import { HostsTab } from './HostsTab.tsx'
@@ -19,12 +19,12 @@ import css from './panel.module.css'
 /** The panel's tab identifiers. */
 export type WinrmTab = 'hosts' | 'console' | 'services' | 'processes' | 'transfer'
 
-/** Panel shell props. */
+/** Panel shell props (the inject face supplied by the main-slot registration). */
 export interface WinrmPanelProps {
-  /** The panel state owner (open/close/toggle). */
-  controller: PanelController
   /** The WinRM API client every tab operates through. */
   api: WinrmApi
+  /** Return to the Conversation (wired to ctx.layout.selectPanel(null)). */
+  onBack: () => void
 }
 
 /** The tab bar definition (labels resolved at render time). */
@@ -43,7 +43,7 @@ interface ConnectRequest {
 }
 
 /** The tabbed WinRM panel. */
-export function WinrmPanel({ controller, api }: WinrmPanelProps) {
+export function WinrmPanel({ api, onBack }: WinrmPanelProps) {
   const [activeTab, setActiveTab] = useState<WinrmTab>('hosts')
   const [connectRequest, setConnectRequest] = useState<ConnectRequest | null>(null)
 
@@ -59,7 +59,7 @@ export function WinrmPanel({ controller, api }: WinrmPanelProps) {
           type="button"
           className={`${css.ghostButton} ${css.backButton}`}
           aria-label={tt('panel.backToConversation')}
-          onClick={() => { controller.close() }}
+          onClick={onBack}
         >
           <span aria-hidden="true">‹</span>
           <span>{tt('panel.backToConversation')}</span>

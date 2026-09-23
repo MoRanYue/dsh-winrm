@@ -17,27 +17,35 @@ import { transform } from 'lightningcss'
 /** Plugin id (package name), stamped into the loader handoff and style tags. */
 const PKG_ID = 'dsh-winrm'
 
-/** Browser platform modules the shell shares into the frozen module table. */
+/**
+ * Browser platform modules the shell shares into the frozen module table.
+ * Mirrors `@deepseek-ai/dsh-client-web/src/platform` so the bundle never
+ * requests a specifier the shell does not seed.
+ */
 const PLATFORM_MODULES = [
   'react', 'react/jsx-runtime', 'react-dom', 'react-dom/client', '@deepseek-ai/cordis',
-  '@deepseek-ai/dsh-client-ui-slots', '@deepseek-ai/dsh-client-ui-primitives',
+  '@deepseek-ai/dsh-client-store',
+  '@deepseek-ai/dsh-client-ui-slots',
+  '@deepseek-ai/dsh-client-ui-primitives',
+  '@deepseek-ai/dsh-client-ui-dockkit',
 ] as const
 
-/** Documented runtime exemption (snapshot-store engine, see preset notes). */
-const RUNTIME_STORE_EXEMPTION = '@deepseek-ai/dsh-client-runtime/client'
-
 /** Externals answered by the loader module table. */
-const CLIENT_EXTERNALS: readonly string[] = [...PLATFORM_MODULES, RUNTIME_STORE_EXEMPTION]
+const CLIENT_EXTERNALS: readonly string[] = [...PLATFORM_MODULES]
 
-/** SDK packages the host half imports at runtime from the profile tree. */
+/**
+ * SDK packages the host half imports at runtime from the profile tree.
+ * `winrm-client` and `ws` are ordinary npm dependencies resolved from the
+ * installed tree, so they stay out of this list (tsdown externalizes
+ * `dependencies` by default).
+ */
 const HOST_EXTERNALS = [
   '@deepseek-ai/cordis',
   '@deepseek-ai/dsh-host-webserver',
   '@deepseek-ai/dsh-llm',
-  '@deepseek-ai/dsh-settings',
   '@deepseek-ai/dsh-system-prompt',
   '@deepseek-ai/dsh-tools',
-  'schemastery',
+  '@deepseek-ai/schemastery',
 ]
 
 /** Virtual-id wrapper keeping module CSS away from tsdown's own css pipeline. */
@@ -95,7 +103,7 @@ const lib: UserConfig = {
   fixedExtension: false,
   dts: false,
   clean: false,
-  external: HOST_EXTERNALS,
+  deps: { neverBundle: HOST_EXTERNALS },
 }
 
 /** Browser half: closure-factory artifact for the GUI module loader. */
@@ -109,8 +117,12 @@ const client: UserConfig = {
   dts: false,
   sourcemap: true,
   clean: false,
-  external: [...CLIENT_EXTERNALS],
-  noExternal: (id: string) => (CLIENT_EXTERNALS.includes(id) ? undefined : true),
+  // Platform modules keep their shell identity; every other import is inlined
+  // into the bundle (a browser half must not require a non-baseline module).
+  deps: {
+    neverBundle: [...CLIENT_EXTERNALS],
+    alwaysBundle: (id: string) => (CLIENT_EXTERNALS.includes(id) ? undefined : true),
+  },
   define: {
     'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV ?? 'production'),
     'import.meta.env.MODE': JSON.stringify(process.env.NODE_ENV ?? 'production'),

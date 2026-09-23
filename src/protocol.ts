@@ -15,9 +15,9 @@ export interface WinHostEntry {
   host: string
   /** WinRM port (5985 HTTP, 5986 HTTPS). */
   port: number
-  /** Login user. pywinrm uses NTLM/Negotiate for local and domain accounts. */
+  /** Login user. The transport auto-selects NTLM/Negotiate or Basic for local and domain accounts. */
   user: string
-  /** Authentication (WinRM password; transport delegates NTLM/Negotiate to pywinrm). */
+  /** Authentication (WinRM password; transport handles NTLM/Negotiate/Basic in-process). */
   auth: {
     kind: 'password'
     password?: string

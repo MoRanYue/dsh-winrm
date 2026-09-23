@@ -1,11 +1,11 @@
 /**
- * WebSocket PowerShell console backed by pywinrm one-shot commands.
+ * WebSocket PowerShell console backed by winrm-client one-shot commands.
  *
- * pywinrm is the working SPNEGO implementation on Windows. Each submitted
- * command is executed through the same UTF-8 envelope as winrm_exec; the
- * WebSocket remains open while commands are serialized. This is intentionally
- * a command console rather than a persistent remote process, so every line
- * is authenticated and isolated.
+ * The native Node WinRM client executes each submitted command through the
+ * same UTF-8 envelope as winrm_exec; the WebSocket remains open while
+ * commands are serialized. This is intentionally a command console rather
+ * than a persistent remote process, so every line is authenticated and
+ * isolated.
  */
 
 import type { WinRMParams } from './client.ts'

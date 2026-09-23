@@ -160,16 +160,49 @@ export function psWriteChunk(p: string, b64: string, append: boolean): string {
   ].join('\r\n')
 }
 
-/** Parse the envelope output: { exitCode, text } or null when absent. */
+/**
+ * Parse the envelope output: { exitCode, text } or null when absent.
+ *
+ * The base64 body is optional and the separating newline may be missing: a
+ * command that printed nothing emits the marker alone (an empty string has
+ * no base64 body), and a transport that trims each response drops the
+ * trailing newline. The exit code is signed because `$LASTEXITCODE` can be
+ * negative.
+ */
 export function parseEnvelope(output: string): { exitCode: number; text: string } | null {
-  const match = /^__DSH_WINRM__(\d+)\r?\n([\s\S]*)$/.exec(output)
+  const match = /^__DSH_WINRM__(-?\d+)(?:\r?\n([\s\S]*))?$/.exec(output)
   if (match === null) return null
   const exitCode = Number.parseInt(match[1], 10)
-  const payload = match[2].trim()
+  const payload = (match[2] ?? '').trim()
   try {
     const text = Buffer.from(payload, 'base64').toString('utf8')
     return { exitCode, text }
   } catch {
     return { exitCode, text: payload }
   }
+}
+
+/** The `#< CLIXML` stream header PowerShell writes once before its serialized records. */
+const CLIXML_HEADER = /^#< CLIXML\r?$/gm
+
+/** One serialized record block (`<Objs …>…</Objs>`) holding host progress/verbose records. */
+const CLIXML_RECORDS = /<Objs\b[^>]*>[\s\S]*?<\/Objs>\r?\n?/g
+
+/**
+ * Remove PowerShell's CLIXML host records from the WinRS stderr stream.
+ *
+ * PowerShell marks its stderr stream with a `#< CLIXML` header line and
+ * serializes the remote host's own progress/verbose records into `<Objs>`
+ * blocks. Both are removed here. Anything else on the stream is genuine
+ * process-level stderr and is preserved verbatim — text written between the
+ * header and a record block (for example `[Console]::Error`) is real output,
+ * not part of the CLIXML payload.
+ *
+ * The script's own error output is already merged into stdout by the
+ * envelope, so this only removes transport-level noise.
+ * @param stderr - raw stderr text captured from the WinRS stream.
+ * @returns the stderr text without CLIXML host records.
+ */
+export function stripClixml(stderr: string): string {
+  return stderr.replace(CLIXML_HEADER, '').replace(CLIXML_RECORDS, '').trim()
 }
