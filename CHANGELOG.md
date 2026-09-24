@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1 - 2026-09-23
+
+### Changed
+
+- Adapted to DeepSeek Harness 0.1.7-rc.1: every `@deepseek-ai/*` SDK dependency moves to `^0.1.7-rc.1`. The APIs this plugin consumes are unchanged in that release, so no source change was required.
+- Declared the shared dsh packages in `peerDependencies` (`dsh-tools`, `dsh-host-webserver`, `dsh-system-prompt`, `dsh-llm`) at `^0.1.7-alpha.2`. This release begins enforcing bundle compatibility from a manifest's dsh peers: the declaration keeps the host's package instances authoritative and refuses a runtime the plugin was not built against (0.2.x) up front instead of failing at runtime.
+
 ## 0.2.0 - 2026-09-23
 
 ### Changed

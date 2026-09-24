@@ -42,12 +42,12 @@ powershell -ExecutionPolicy Bypass -File .\scripts\enable-winrm.ps1
 
 ## 安装
 
-> 需要 DeepSeek Harness **0.1.7-alpha.2** 或更新版本（使用 `main` / `sidebar.panellist` 插槽与 volatile 配置表单）。
+> 需要 DeepSeek Harness **0.1.7 系列**（`0.1.7-alpha.2` 及以后，含 `0.1.7-rc.1`）。插件的 `peerDependencies` 声明为 `^0.1.7-alpha.2`，DSH 启动时会据此校验：0.1.x 各版本可加载，`0.2.0` 起会被拒绝（确需冒险可用 `dsh plugin allow-version` 逐版本放行）。
 
 从 [Releases](https://github.com/andyfan1094/dsh-winrm/releases) 下载最新的 `dsh-winrm-*.tgz`，加入 profile：
 
 ```powershell
-dsh plugin --profile web add D:\downloads\dsh-winrm-0.2.0.tgz
+dsh plugin --profile web add D:\downloads\dsh-winrm-0.2.1.tgz
 ```
 
 本地开发可用 profile 链接安装：
