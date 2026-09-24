@@ -50,5 +50,22 @@ jobs:
 
       # `prepack` runs the full check (typecheck + build + tests), so a broken
       # revision cannot be published.
+      #
+      # Publishing is idempotent: the bootstrap release is cut by hand (OIDC
+      # cannot mint a package's first version), and tagging that same commit
+      # afterwards must not fail the run with a version conflict.
+      - name: Check whether this version is already published
+        id: registry
+        run: |
+          set -eu
+          version="$(node -p "require('./package.json').version")"
+          if npm view "dsh-winrm@$version" version >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "dsh-winrm@$version is already on the registry; skipping publish."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish to npm
+        if: steps.registry.outputs.exists == 'false'
         run: npm publish

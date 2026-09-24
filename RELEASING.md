@@ -23,6 +23,10 @@ Verify the result, then finish the setup:
 npm view dsh-winrm version
 ```
 
+Tagging that same commit (`git tag v0.1.0 && git push origin v0.1.0`) is safe:
+the workflow checks the registry first and skips publishing a version that is
+already there, so the bootstrap release does not fail the run.
+
 ## One-time bootstrap: authorize this workflow
 
 After the first version exists, open the package on npmjs.com →
