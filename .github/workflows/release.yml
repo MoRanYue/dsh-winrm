@@ -1,0 +1,54 @@
+name: release
+
+# Publishes the bundle to npm when a version tag is pushed.
+#
+# Authentication uses npm trusted publishing (OIDC) — no long-lived npm token
+# is stored in the repository. This requires a one-time setup on npmjs.com:
+# open the package's Settings -> Trusted publishing and register this exact
+# workflow filename (`release.yml`) for this repository. npm cannot mint a
+# package's FIRST version over OIDC, so the initial release must be published
+# manually (see RELEASING.md); every later tag publishes from here.
+#
+# Provenance attestations are generated automatically for a public package
+# built from a public repository.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write # required for OIDC
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false # never cache in a release build
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify the tag matches package.json
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "tag v$tag does not match package.json version $pkg" >&2
+            exit 1
+          fi
+
+      # `prepack` runs the full check (typecheck + build + tests), so a broken
+      # revision cannot be published.
+      - name: Publish to npm
+        run: npm publish

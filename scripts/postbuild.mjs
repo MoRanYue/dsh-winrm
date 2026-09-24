@@ -3,7 +3,11 @@
  * loader handoff (window.__ModuleLoader__.load({id, factory})) and restore
  * the CJS preamble (var module/exports) that this rolldown generation omits,
  * exactly matching the official dsh-web-ui artifact shape. Emits
- * lib/client.js (+ map) that the loader serves at /plugins/winrm/client.js.
+ * lib/client.js that the loader serves at /plugins/winrm/client.js.
+ *
+ * The source map stays a local debugging aid and is not part of the published
+ * payload (`files` omits `*.map`), so the wrapper does not reference it — a
+ * published bundle must not point at a file that is not shipped.
  */
 import { readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -28,7 +32,6 @@ const wrapped = [
   '\t\treturn module.exports;',
   '\t}',
   '});',
-  '//# sourceMappingURL=client.js.map',
   '',
 ].join('\n')
 

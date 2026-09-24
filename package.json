@@ -1,8 +1,9 @@
 {
   "name": "dsh-winrm",
   "description": "Remote Windows administration for the dsh web GUI: WinRM/PowerShell Remoting host config store (~/.dsh/dsh-winrm.json), PowerShell exec / streaming console / service & process management / base64-chunked file transfer / cluster execution, plus agent tools (winrm_list, winrm_exec, winrm_service, winrm_process, winrm_upload, winrm_download, winrm_cluster). Runs entirely on a native Node.js WinRM client (winrm-client) — no Python/pywinrm required. Standalone Cordis plugin — mounted via cordis.patch.yml + a profile node_modules link, no dsh source changes.",
-  "version": "0.2.1",
+  "version": "0.1.0",
   "type": "module",
+  "packageManager": "pnpm@11.7.0",
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
   },
@@ -75,13 +76,12 @@
   },
   "files": [
     "lib/**/*.js",
-    "lib/**/*.js.map",
     "lib/**/*.d.ts",
-    "lib/**/*.d.ts.map",
     "src",
     "cordis.patch.yml",
     "README.md",
     "README.zh.md",
+    "RELEASING.md",
     "scripts"
   ],
   "license": "Apache-2.0",
@@ -97,7 +97,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/andyfan1094/dsh-winrm.git"
+    "url": "git+https://github.com/MoRanYue/dsh-winrm.git"
   },
   "keywords": [
     "dsh",
