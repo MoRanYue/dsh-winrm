@@ -4,6 +4,8 @@
 
 仿照 [dsh-ssh](https://github.com/zhu1090093659/dsh-web-ui/tree/main/packages/dsh-ssh) 开发的 DSH 插件：用 Windows 原生的 **WinRM / PowerShell Remoting** 协议远程管理 Windows 服务器，**目标机不需要装 OpenSSH**。
 
+> **来源**：本项目是 [andyfan1094/dsh-winrm](https://github.com/andyfan1094/dsh-winrm)（Apache-2.0）的分支，把后端的 WinRM 实现从 Python + pywinrm 换成原生 Node.js 客户端（[winrm-client](https://github.com/shide1989/winrm-client)），因此**本机不再需要 Python**。GUI、Agent 工具与功能范围沿用上游设计。
+
 ## 功能
 
 | 面 | 说明 |
