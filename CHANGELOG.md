@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1
+
+### Fixed
+
+- `winrm_list` no longer fails with `returned invalid output` on hosts that set `rejectUnauthorized`. `HostStore.summarize()` emits that field, but the tool's declared output schema omitted it, and the harness enforces `additionalProperties: false` — so any host configured with an explicit self-signed-certificate choice broke the call.
+- Added `tests/tools.test.ts`, which validates each tool's real output value against its own declared schema, so an engine field without a matching schema entry fails in tests instead of at runtime.
+
 ## 0.1.0 - 2026-09-24
 
 First npm release. The plugin is now built against DeepSeek Harness 0.1.7 and runs WinRM entirely in Node.

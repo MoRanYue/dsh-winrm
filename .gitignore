@@ -1,3 +1,4 @@
 node_modules/
 lib/
 *.tgz
+*.git-commit-msg.txt

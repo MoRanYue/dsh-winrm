@@ -80,6 +80,7 @@ export function winrmListTool(engine: WinRmEngine) {
                 user: { type: 'string', required: true },
                 auth: { type: 'string', enum: ['password'], required: true },
                 transport: { type: 'string', enum: ['http', 'https'], required: true },
+                rejectUnauthorized: { type: 'boolean' },
                 description: { type: 'string' },
                 environment: { type: 'string' },
                 tags: { type: 'array', items: { type: 'string' }, required: true },
