@@ -2,11 +2,11 @@
  * WinRM transport bridge.
  *
  * Runs each PowerShell payload over a native Node.js WinRM client
- * (winrm-client) — no Python/pywinrm subprocess. The script rides the
- * UTF-8 base64 envelope (marker + base64 of UTF-8 output) so Chinese and
- * any codepage output survives the WinRM transport losslessly; the envelope
- * is base64-encoded with `-EncodedCommand`, keeping the command line a
- * single ASCII-safe line that WinRS/cmd.exe cannot mangle.
+ * (winrm-client) — no Python/pywinrm subprocess. The script is delivered on
+ * the WinRS **stdin** stream and answers on the UTF-8 base64 envelope, so
+ * Chinese and any codepage output survives the transport losslessly and the
+ * command line stays a constant, ASCII-safe line that WinRS/cmd.exe cannot
+ * mangle. See powershell.ts for why the command line cannot carry the script.
  *
  * Auth is chosen per attempt (HTTPS: Basic first, then NTLM; HTTP: NTLM
  * first, then Basic) with fallback, so a host that only enables one scheme
@@ -16,7 +16,7 @@
 
 import { Command, Shell } from 'winrm-client'
 import type { WinHostEntry } from '../protocol.ts'
-import { parseEnvelope, powershellCommandLine, psFileSize, psReadChunk, psWriteChunk, stripClixml, winrmPowerShellScript } from '../powershell.ts'
+import { parseEnvelope, powershellCommandLine, psFileSize, psReadChunk, psWriteChunk, scriptPayload, splitScriptPayload, stripClixml } from '../powershell.ts'
 
 /** Connection parameters for one target (transport-agnostic projection of a host entry). */
 export interface WinRMParams {
@@ -86,11 +86,11 @@ function baseParams(conn: WinRMParams, authMethod: WinrmAuth) {
 }
 
 /**
- * One shell lifecycle: create → run the encoded script → receive until the
- * command completes → delete. Bounded by an overall deadline; on timeout the
- * delete is fired without blocking the caller.
+ * One shell lifecycle: create → run the constant envelope script → push the
+ * payload on stdin → receive until the command completes → delete. Bounded by
+ * an overall deadline; on timeout the delete is fired without blocking.
  * @param conn - connection parameters.
- * @param envelope - the wrapped UTF-8 envelope script (already prepared).
+ * @param payload - the stdin payload (`<byteCount>\n<script>`).
  * @param timeoutMs - command execution budget measured from just after Execute.
  * @param authMethod - the auth scheme for this attempt.
  * @returns stdout/stderr captured from the WinRS streams.
@@ -98,7 +98,7 @@ function baseParams(conn: WinRMParams, authMethod: WinrmAuth) {
  */
 async function attemptOnce(
   conn: WinRMParams,
-  envelope: string,
+  payload: string,
   timeoutMs: number,
   authMethod: WinrmAuth,
 ): Promise<{ stdout: string; stderr: string }> {
@@ -117,8 +117,10 @@ async function attemptOnce(
       void Shell.doDeleteShell({ ...base, shellId }).catch(() => undefined)
       throw new WinrmTimedOut()
     }
-    const command = powershellCommandLine(envelope)
-    const commandId = await Command.doExecuteCommand({ ...base, shellId, command })
+    const commandId = await Command.doExecuteCommand({ ...base, shellId, command: powershellCommandLine() })
+    for (const piece of splitScriptPayload(payload)) {
+      await Command.doSendInput({ ...base, shellId, commandId, input: piece })
+    }
     const receive = { ...base, shellId, commandId }
     const commandDeadline = Date.now() + timeoutMs
     let stdout = ''
@@ -156,21 +158,21 @@ async function attemptOnce(
  * succeeds. A timeout aborts immediately (retrying auth would waste the
  * remaining budget on a reachable-but-slow host).
  * @param conn - connection parameters.
- * @param envelope - the wrapped UTF-8 envelope script.
+ * @param payload - the stdin payload (`<byteCount>\n<script>`).
  * @param timeoutMs - command execution budget.
  * @returns captured stdout/stderr.
  * @throws WinrmTimedOut on deadline; the last auth/transport error when every scheme fails.
  */
 async function runWinrm(
   conn: WinRMParams,
-  envelope: string,
+  payload: string,
   timeoutMs: number,
 ): Promise<{ stdout: string; stderr: string }> {
   const candidates: WinrmAuth[] = conn.useHttps ? ['basic', 'ntlm'] : ['ntlm', 'basic']
   let lastError: unknown
   for (const authMethod of candidates) {
     try {
-      return await attemptOnce(conn, envelope, timeoutMs, authMethod)
+      return await attemptOnce(conn, payload, timeoutMs, authMethod)
     } catch (error) {
       if (error instanceof WinrmTimedOut) throw error
       lastError = error
@@ -186,11 +188,11 @@ export async function runScript(
 ): Promise<{ stdout: string; stderr: string; exitCode: number | null; timedOut: boolean; durationMs: number }> {
   const started = Date.now()
   const timeoutMs = options.timeoutMs ?? 60_000
-  const envelope = winrmPowerShellScript(script)
+  const payload = scriptPayload(script)
 
   let outcome: { stdout: string; stderr: string }
   try {
-    outcome = await runWinrm(conn, envelope, timeoutMs)
+    outcome = await runWinrm(conn, payload, timeoutMs)
   } catch (error) {
     if (error instanceof WinrmTimedOut) {
       return { stdout: '', stderr: '', exitCode: null, timedOut: true, durationMs: Date.now() - started }
@@ -207,10 +209,10 @@ export async function runScript(
   const exitCode = parsed !== null ? parsed.exitCode : 1
   // A script that reached the envelope leaves only the host's CLIXML records
   // on stderr; an aborted one keeps its stderr untouched for diagnosis.
-  const stderr = parsed !== null ? stripClixml(outcome.stderr) : outcome.stderr
+  const stderr = parsed !== null ? stripClixml(parsed.stderr) : outcome.stderr
   options.onChunk?.({ output: raw, stderr })
   return {
-    stdout: parsed !== null ? parsed.text : raw,
+    stdout: parsed !== null ? parsed.stdout : raw,
     stderr,
     exitCode,
     timedOut: false,

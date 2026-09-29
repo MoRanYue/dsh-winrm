@@ -24,8 +24,9 @@
 - 本地账户可写 `Administrator`；域账户可写 `DOMAIN\user` 或 `user@domain`
 - 本机无需 Python —— WinRM 走纯 Node 依赖（winrm-client），随插件一起安装
 - 传输：HTTP(5985) 或 HTTPS(5986)；HTTPS 可勾选「接受自签名证书」
-- 中文输出不乱码：所有命令走 **UTF-8 base64 信封**（`-EncodedCommand` + `Out-String` 包装），绕过 WinRM 传输的代码页问题
+- 中文输出不乱码：所有命令走 **UTF-8 base64 信封**（`Out-String -Stream` 包装 + 三条带标签的信封行），绕过 WinRM 传输的代码页问题
 - 命令结果的 `stderr` 已自动剥离 PowerShell 的 CLIXML 宿主机记录；真实的进程级 stderr（如 `[Console]::Error`）原样保留
+- **脚本走 WinRS stdin，不走命令行**：WinRS 把命令行交给 `cmd.exe`，上限约 8191 字符，而 `-EncodedCommand` 会把脚本膨胀 2.67 倍 —— 命令行长脚本此前会直接报 `The command line is too long.`。现在命令行是**常量**，脚本按 UTF-8 字节数分块送到 stdin，实测 200 KB 脚本正常
 
 ## 目标机准备（一次性）
 
@@ -41,12 +42,12 @@ powershell -ExecutionPolicy Bypass -File .\scripts\enable-winrm.ps1
 
 ## 安装
 
-> 需要 DeepSeek Harness **0.1.7 系列**（`0.1.7-alpha.2` 及以后，含 `0.1.7-rc.1`）。插件的 `peerDependencies` 声明为 `^0.1.7-alpha.2`，DSH 启动时会据此校验：0.1.x 各版本可加载，`0.2.0` 起会被拒绝（确需冒险可用 `dsh plugin allow-version` 逐版本放行）。
+> 需要 DeepSeek Harness **0.1.7-alpha.2 及以后**（含 `0.1.7-rc.1`、`0.2.0-rc.*`、`0.2.x`）。插件的 `peerDependencies` 声明为 `^0.1.7-alpha.2 || ^0.2.0-rc.1`，DSH 启动时会据此校验：0.1.7 与 0.2.x 各版本可加载，`0.3.0` 起会被拒绝（确需冒险可用 `dsh plugin allow-version` 逐版本放行）。
 
 从 [Releases](https://github.com/MoRanYue/dsh-winrm/releases) 下载最新的 `dsh-winrm-*.tgz`，加入 profile：
 
 ```powershell
-dsh plugin --profile web add D:\downloads\dsh-winrm-0.1.0.tgz
+dsh plugin --profile web add D:\downloads\dsh-winrm-0.2.0.tgz
 ```
 
 也可以直接从 npm 安装：
@@ -92,7 +93,7 @@ src/
   engine.ts           WinRmEngine 门面：exec / services / processes / ls / upload / download / console / cluster / test
   store.ts            ~/.dsh/dsh-winrm.json 主机存储（原子写，0600）
   protocol.ts         宿主↔浏览器 wire 类型
-  powershell.ts       PS 片段构造器（UTF-8 信封 / 服务 / 进程 / 目录 / 分块读写）
+  powershell.ts       PS 片段构造器 + stdin 信封（outer/child 包装 / 服务 / 进程 / 目录 / 分块读写）
   routes.ts           /api/dsh-winrm 路由族 + 控制台 WebSocket（loopback 围栏）
   tools.ts            7 个 winrm_* agent 工具
   engine/client.ts    winrm-client 传输层：进程内认证（NTLM/Basic）、UTF-8 信封、分块传输
@@ -108,7 +109,7 @@ scripts/
 ## 已知限制
 
 - 控制台是命令会话，不保持 PowerShell 变量和当前目录状态；每条命令独立执行
-- WinRM 单次响应受 150KB 信封上限约束，传输按 48KB 分块，大文件较慢（每块一次往返）
+- 传输按 48KB 分块，大文件较慢（每块一次往返）；分块大小由 `TRANSFER_CHUNK` 决定，脚本本身已不再受命令行长度限制
 - 单命令默认 60s 超时，可传 `timeoutMs`
 - 目标机需已启用 WinRM（见上）；HTTP 明文 Basic 不应用于公网
 - 面板关闭再打开会回到「主机」页签：面板是 `main` 插槽的占用者，切回对话时卸载，页签状态不跨开关保留
