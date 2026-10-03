@@ -15,7 +15,7 @@
 | PowerShell 控制台 | WebSocket 命令会话（每条命令通过原生 Node WinRM 客户端执行，输出实时返回） |
 | 服务管理 | 列出 / 启动 / 停止 / 重启 / 改启动类型（自动/手动/禁用） |
 | 进程管理 | 列出（CPU/内存/路径）/ 按 PID 结束 |
-| 文件传输 | base64 分块读写，**不依赖 SMB**，任意路径可传；上传自动建目录 |
+| 文件传输 | WinRM 流式传输（上传单 shell 单流 / 下载并行区间，**不依赖 SMB**，任意路径可传）；上传自动建目录 |
 | 集群 | 一条命令并发跑多台主机（按 aliases / environment / tags 过滤） |
 
 ## 认证与传输
@@ -47,7 +47,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\enable-winrm.ps1
 从 [Releases](https://github.com/MoRanYue/dsh-winrm/releases) 下载最新的 `dsh-winrm-*.tgz`，加入 profile：
 
 ```powershell
-dsh plugin --profile web add D:\downloads\dsh-winrm-0.2.0.tgz
+dsh plugin --profile web add D:\downloads\dsh-winrm-0.3.0.tgz
 ```
 
 也可以直接从 npm 安装：
@@ -93,10 +93,11 @@ src/
   engine.ts           WinRmEngine 门面：exec / services / processes / ls / upload / download / console / cluster / test
   store.ts            ~/.dsh/dsh-winrm.json 主机存储（原子写，0600）
   protocol.ts         宿主↔浏览器 wire 类型
-  powershell.ts       PS 片段构造器 + stdin 信封（outer/child 包装 / 服务 / 进程 / 目录 / 分块读写）
+  powershell.ts       PS 片段构造器 + stdin 信封（outer/child 包装 / 服务 / 进程 / 目录 / 流式收发脚本）
   routes.ts           /api/dsh-winrm 路由族 + 控制台 WebSocket（loopback 围栏）
   tools.ts            7 个 winrm_* agent 工具
-  engine/client.ts    winrm-client 传输层：进程内认证（NTLM/Basic）、UTF-8 信封、分块传输
+  engine/client.ts    winrm-client 传输层：进程内认证（NTLM/Basic）、UTF-8 信封、流式上传/下载 + 分块回退
+  engine/wsman.ts     手写 WSMan Send/Receive 信封（原始字节走 stdin，不做二次 base64；512000 信封上限）
   engine/console.ts   流式 PowerShell 控制台会话
   client/             浏览器半：侧边栏入口 + 居中面板（5 页签）
 scripts/
@@ -109,7 +110,10 @@ scripts/
 ## 已知限制
 
 - 控制台是命令会话，不保持 PowerShell 变量和当前目录状态；每条命令独立执行
-- 传输按 48KB 分块，大文件较慢（每块一次往返）；分块大小由 `TRANSFER_CHUNK` 决定，脚本本身已不再受命令行长度限制
+- 上传走**单条 stdin 流**：一个 shell、一个命令，每 256KB 一个 `Send`，可压缩内容自动按块 gzip（实测 1.7MB JSON 线上仅 91KB）。旧的 48KB 分块路径保留为回退，仅在流式通道不可用时启用
+- 下载走**并行区间流**：默认最多 4 个 worker，各自一个 shell 读同一文件的绝对字节区间，远端 gzip 后回传，本地按 offset 落位（实测 2MiB 约 10-12 秒，16MiB 约 21-23 秒，可压缩的 16MiB 约 6 秒；旧的 48KB 分块路径 2MiB 需 129 秒，保留为回退）。服务端单次 `Receive` 最多回 128KB，与信封大小无关，所以下载是往返次数受限而非带宽受限
+- `channel=auto`（默认）先探测目标机 445 端口：`net use` 自身没有短超时，SMB 不可用时要等约 60 秒才失败，此前这段等待发生在每次上传之前。现在 3 秒内判定并直接走 WinRM
+- 下载失败不留残file：已写入的数据会被丢弃、目标文件被删除；若失败发生在任何字节到达之前（路径不存在、目标是目录、主机不可达），已存在的本地文件保持原样不动（目标文件在首次写入时才创建）
 - 单命令默认 60s 超时，可传 `timeoutMs`
 - 目标机需已启用 WinRM（见上）；HTTP 明文 Basic 不应用于公网
 - 面板关闭再打开会回到「主机」页签：面板是 `main` 插槽的占用者，切回对话时卸载，页签状态不跨开关保留

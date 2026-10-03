@@ -1,17 +1,18 @@
 /**
  * SMB transfer bridge.
  *
- * The WinRM base64 chunk bridge is reliable for small files but breaks for
- * large artifacts (the WinRM/HTTP envelope rejects large payloads), so whole
- * files ride the remote admin share. This module mounts the remote host's
- * admin share with `net use` (password passed via stdin, never argv), copies
- * whole files with node:fs, then verifies the SHA-256 on both ends.
+ * SMB is the fast channel when the admin share is reachable, so `auto` tries it
+ * first and falls back to the WinRM streaming path. This module mounts the
+ * remote host's admin share with `net use` (password passed via stdin, never
+ * argv), copies whole files with node:fs, then verifies the SHA-256 on both
+ * ends.
  */
 
 import { spawn } from 'node:child_process'
 import { copyFile, stat } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
+import { createConnection } from 'node:net'
 import type { WinHostEntry } from './protocol.ts'
 
 /** Per-transfer channel selector. */
@@ -83,6 +84,57 @@ async function remoteSha256(host: string, remotePath: string): Promise<string> {
   const match = /([0-9A-Fa-f]{64})/.exec(stdout)
   if (match === null) throw new Error('SMB remote hash verification failed: ' + stdout)
   return match[1].toUpperCase()
+}
+
+/** How long a reachability verdict is trusted before probing again. */
+const SMB_PROBE_TTL_MS = 60_000
+
+/** Budget for the TCP reachability probe; far below `net use`'s own timeout. */
+const SMB_PROBE_TIMEOUT_MS = 3_000
+
+const smbProbeCache = new Map<string, { reachable: boolean; at: number }>()
+
+/**
+ * Whether the target's SMB port (445) accepts a connection.
+ *
+ * `net use` is the only way to mount the admin share, but it has no useful
+ * timeout: against a host whose 445 is filtered or whose SMB service is down it
+ * spends a full minute before failing. That minute was being paid on *every*
+ * `auto` upload before the WinRM fallback could even start — measured at 61 s
+ * and 58 s on the test host, against a 12 s streaming transfer. A bare TCP
+ * connect answers the same question in milliseconds.
+ *
+ * A negative verdict is cached briefly so a burst of transfers does not re-probe
+ * for each one; a positive verdict is cached too, but the `net use` that follows
+ * still reports its own failure if the share turns out to be unmountable.
+ * @param host - target hostname or address.
+ * @returns true when port 445 accepted a connection.
+ */
+export async function smbReachable(host: string): Promise<boolean> {
+  const cached = smbProbeCache.get(host)
+  if (cached !== undefined && Date.now() - cached.at < SMB_PROBE_TTL_MS) return cached.reachable
+  const reachable = await new Promise<boolean>((resolve) => {
+    const socket = createConnection({ host, port: 445 })
+    let settled = false
+    const finish = (value: boolean): void => {
+      if (settled) return
+      settled = true
+      socket.destroy()
+      resolve(value)
+    }
+    const timer = setTimeout(() => finish(false), SMB_PROBE_TIMEOUT_MS)
+    socket.once('connect', () => { clearTimeout(timer); finish(true) })
+    socket.once('error', () => { clearTimeout(timer); finish(false) })
+    socket.once('timeout', () => { clearTimeout(timer); finish(false) })
+    socket.setTimeout(SMB_PROBE_TIMEOUT_MS)
+  })
+  smbProbeCache.set(host, { reachable, at: Date.now() })
+  return reachable
+}
+
+/** Error thrown when SMB was requested or probed and the target is not listening. */
+export function smbUnavailable(host: string): Error {
+  return new Error('SMB is not reachable on ' + host + ':445 (the admin share needs TCP 445 open and the Server service running)')
 }
 
 /**

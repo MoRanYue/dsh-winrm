@@ -153,6 +153,57 @@ export function powershellCommandLine(): string {
 }
 
 /**
+ * Bootstrap for the streaming upload path: read `<byteCount>\n<script>` from
+ * stdin, then run that script **in this process** so it can keep draining the
+ * same stdin stream.
+ *
+ * This exists because {@link psReceiveStream} outgrew the command line. WinRS
+ * hands the command line to cmd.exe, whose limit is about 8191 characters, and
+ * the receiver is 3424 characters of PowerShell — 9206 once base64-of-UTF-16
+ * expands it, over the cap. Shipping the receiver on stdin instead costs one
+ * extra `Send` and keeps the command line a constant 1154 characters no matter
+ * how the receiver grows.
+ *
+ * Running the receiver in-process (rather than in a child, as
+ * {@link OUTER_SCRIPT} does) is what makes the handoff work: the child would
+ * need its own stdin, and the payload has to keep flowing into whatever reads
+ * the file. A fresh `[Console]::OpenStandardInput()` inside the receiver picks
+ * up exactly where this bootstrap stopped reading, because `Read` on the raw
+ * stream never buffers ahead of the count it was asked for.
+ */
+const STREAM_BOOTSTRAP = [
+  "$ErrorActionPreference='Continue'",
+  '[Console]::OutputEncoding=[Text.Encoding]::UTF8',
+  '$i=[Console]::OpenStandardInput()',
+  "$d=''",
+  'while($true){$b=$i.ReadByte();if($b -lt 0 -or $b -eq 10){break};if($b -ne 13){$d+=[char]$b}}',
+  '$n=[int]$d',
+  '$u=New-Object byte[] $n',
+  '$r=0',
+  'while($r -lt $n){$k=$i.Read($u,$r,$n-$r);if($k -le 0){break};$r+=$k}',
+  '$s=[Text.Encoding]::UTF8.GetString($u,0,$r)',
+  '$c=0',
+  'try{',
+  '  &([scriptblock]::Create($s))',
+  '}catch{',
+  '  [Console]::Error.WriteLine([string]($_|Out-String))',
+  '  $c=1',
+  '}',
+  'exit $c',
+  '',
+].join('\r\n')
+
+/**
+ * The constant powershell.exe command line for a streaming upload.
+ *
+ * The receiver travels on stdin right behind it, so this stays well clear of
+ * cmd.exe's cap and does not change when the receiver does.
+ */
+export function streamCommandLine(): string {
+  return 'powershell.exe -NoProfile -NoLogo -ExecutionPolicy Bypass -EncodedCommand ' + encodeCommand(STREAM_BOOTSTRAP)
+}
+
+/**
  * The stdin payload for one command: the UTF-8 **byte** count, a newline, then
  * the raw script.
  *
@@ -245,11 +296,16 @@ export function psListDir(dir: string): string {
   ].join('\r\n')
 }
 
-/** Plain: remote file size in bytes (0 when missing). */
+/**
+ * Plain: remote file size in bytes. Emits nothing at all when the path is
+ * missing or is a directory, so the caller can tell "absent" from "empty" —
+ * both used to collapse to the string "0", which made a download of a
+ * nonexistent file look like a successful transfer of a zero-byte one.
+ */
 export function psFileSize(p: string): string {
   return [
     '$__f = Get-Item -LiteralPath ' + sq(p) + ' -ErrorAction SilentlyContinue',
-    'if ($null -eq $__f) { "0" } elseif ($__f.PSIsContainer) { "0" } else { [string]$__f.Length }',
+    'if ($null -ne $__f -and -not $__f.PSIsContainer) { [string]$__f.Length }',
     '',
   ].join('\r\n')
 }
@@ -285,6 +341,246 @@ export function psWriteChunk(p: string, b64: string, append: boolean): string {
     '[string]$__b.Length',
     '',
   ].join('\r\n')
+}
+
+/** Magic stamped into the frame header that precedes every stream chunk. */
+export const STREAM_FRAME_MAGIC = 'DSHZ'
+
+/** Frame header size: 4 magic bytes + 4 little-endian length bytes + 1 mode byte + 1 reserved. */
+export const STREAM_FRAME_HEADER_BYTES = 10
+
+/** Frame mode: the payload after the header is a gzip member. */
+export const STREAM_FRAME_GZIP = 1
+
+/** Frame mode: the payload after the header is raw file bytes. */
+export const STREAM_FRAME_RAW = 0
+
+/** Frame mode: the payload after the header is the transfer's metadata. */
+export const STREAM_FRAME_HEADER = 2
+
+/** Remote-side buffer used while draining stdin (or inflating a frame) into the file. */
+const STREAM_BUFFER_BYTES = 262_144
+
+/**
+ * Wrap one payload in a stream frame: `DSHZ` + uint32LE length + mode + pad.
+ *
+ * The frame is what makes a compressed stream legal on a pipe. stdin cannot
+ * seek, so the receiver has to be handed the exact byte count of the next gzip
+ * member before it lets `GZipStream` touch it; otherwise the inflater would
+ * read into the member that follows and the stream would desynchronize. The
+ * mode byte travels with the payload so the client can switch between gzip and
+ * raw per chunk.
+ * @param payload - gzip member bytes or raw file bytes.
+ * @param mode - `STREAM_FRAME_GZIP` or `STREAM_FRAME_RAW`.
+ * @returns the framed chunk to place on the stdin stream.
+ */
+export function buildStreamFrame(payload: Buffer, mode: number): Buffer {
+  const frame = Buffer.alloc(STREAM_FRAME_HEADER_BYTES + payload.length)
+  frame.write(STREAM_FRAME_MAGIC, 0, 'ascii')
+  frame.writeUInt32LE(payload.length, 4)
+  frame[8] = mode
+  frame[9] = 0
+  payload.copy(frame, STREAM_FRAME_HEADER_BYTES)
+  return frame
+}
+
+/**
+ * Streaming receiver: drain framed stdin chunks into the file named by the
+ * header frame, until the declared byte count lands.
+ *
+ * This is the fast upload path. Instead of shipping base64 text inside a
+ * PowerShell script — which costs one full shell create/command/delete cycle
+ * per 48 KiB — the remote shell starts this script once and the client then
+ * pushes bytes straight down the WinRS stdin stream. The only per-chunk cost
+ * left is a single `Send`, so a whole file costs one shell and one command no
+ * matter how large it is.
+ *
+ * The script deliberately takes **no arguments**. The destination path and
+ * total byte count arrive as the first frame on stdin, which keeps the command
+ * line a constant size: WinRS hands the command line to cmd.exe, whose limit
+ * is about 8191 characters, and a long remote path interpolated into the
+ * script would eat into that budget (the script is base64-of-UTF-16 on the
+ * wire, so every character costs 2.67). Reading them from the stream removes
+ * the limit entirely and mirrors how `powershellCommandLine` stays constant.
+ *
+ * Every wire chunk is a frame: `DSHZ` + 4-byte little-endian payload length +
+ * 1 mode byte + 1 reserved, followed by exactly that many payload bytes. The
+ * explicit frame is what makes a *pipe* usable for a compressed stream: stdin
+ * cannot seek, so the receiver must be told how long the next gzip member is
+ * before it hands the bytes to `GZipStream`, or the inflater would read into
+ * the member that follows. The mode byte lets the client pick per chunk — gzip
+ * when it actually shrinks the data, raw bytes when it would not — so
+ * incompressible files never pay compression overhead.
+ *
+ * The script prints the three-line envelope on stdout with the byte count as
+ * its payload, so the caller can prove the transfer landed complete.
+ * @returns a PowerShell script suitable for `-EncodedCommand`.
+ */
+export function psReceiveStream(): string {
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    "$__a = ''",
+    "$__e = ''",
+    '$__c = 0',
+    'try {',
+    '  $__i = [Console]::OpenStandardInput()',
+    '  $__hdr = New-Object byte[] ' + String(STREAM_FRAME_HEADER_BYTES),
+    '  $__got = 0',
+    '  while ($__got -lt $__hdr.Length) {',
+    '    $__k = $__i.Read($__hdr, $__got, $__hdr.Length - $__got)',
+    '    if ($__k -le 0) { break }',
+    '    $__got += $__k',
+    '  }',
+    '  if ($__got -lt $__hdr.Length) { throw ' + sq('upload stream ended before its header') + ' }',
+    '  if (-not ($__hdr[0] -eq 68 -and $__hdr[1] -eq 83 -and $__hdr[2] -eq 72 -and $__hdr[3] -eq 90)) { throw ' + sq('upload stream lost frame alignment') + ' }',
+    '  if ($__hdr[8] -ne ' + String(STREAM_FRAME_HEADER) + ') { throw ' + sq('upload stream started without a header frame') + ' }',
+    '  $__size = 0',
+    '  for ($__j = 0; $__j -lt 4; $__j++) { $__size = $__size -bor ([int]$__hdr[4 + $__j] -shl (8 * $__j)) }',
+    '  $__meta = New-Object byte[] $__size',
+    '  $__got = 0',
+    '  while ($__got -lt $__size) {',
+    '    $__k = $__i.Read($__meta, $__got, $__size - $__got)',
+    '    if ($__k -le 0) { break }',
+    '    $__got += $__k',
+    '  }',
+    '  if ($__got -lt $__size) { throw ' + sq('upload stream truncated its header frame') + ' }',
+    '  $__text = [System.Text.Encoding]::UTF8.GetString($__meta)',
+    '  $__cut = $__text.IndexOf([char]10)',
+    '  if ($__cut -lt 0) { throw ' + sq('upload header frame is malformed') + ' }',
+    '  $__n = [long]$__text.Substring(0, $__cut)',
+    '  $__p = $__text.Substring($__cut + 1)',
+    '  $__d = [System.IO.Path]::GetDirectoryName($__p)',
+    '  if (-not [string]::IsNullOrEmpty($__d)) { [System.IO.Directory]::CreateDirectory($__d) | Out-Null }',
+    '  $__fs = New-Object System.IO.FileStream($__p, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)',
+    '  $__w = 0',
+    '  try {',
+    '    $__buf = New-Object byte[] ' + String(STREAM_BUFFER_BYTES),
+    '    while ($__w -lt $__n) {',
+    '      $__got = 0',
+    '      while ($__got -lt $__hdr.Length) {',
+    '        $__k = $__i.Read($__hdr, $__got, $__hdr.Length - $__got)',
+    '        if ($__k -le 0) { break }',
+    '        $__got += $__k',
+    '      }',
+    '      if ($__got -lt $__hdr.Length) { break }',
+    '      if (-not ($__hdr[0] -eq 68 -and $__hdr[1] -eq 83 -and $__hdr[2] -eq 72 -and $__hdr[3] -eq 90)) { throw ' + sq('upload stream lost frame alignment') + ' }',
+    '      $__size = 0',
+    '      for ($__j = 0; $__j -lt 4; $__j++) { $__size = $__size -bor ([int]$__hdr[4 + $__j] -shl (8 * $__j)) }',
+    '      $__mode = $__hdr[8]',
+    '      $__blob = New-Object byte[] $__size',
+    '      $__got = 0',
+    '      while ($__got -lt $__size) {',
+    '        $__k = $__i.Read($__blob, $__got, $__size - $__got)',
+    '        if ($__k -le 0) { break }',
+    '        $__got += $__k',
+    '      }',
+    '      if ($__got -lt $__size) { break }',
+    '      if ($__mode -eq ' + String(STREAM_FRAME_GZIP) + ') {',
+    '        $__ms = New-Object System.IO.MemoryStream(, $__blob)',
+    '        $__gz = New-Object System.IO.Compression.GZipStream($__ms, [System.IO.Compression.CompressionMode]::Decompress)',
+    '        try {',
+    '          while ($true) {',
+    '            $__k = $__gz.Read($__buf, 0, $__buf.Length)',
+    '            if ($__k -le 0) { break }',
+    '            $__fs.Write($__buf, 0, $__k)',
+    '            $__w += $__k',
+    '          }',
+    '        } finally { $__gz.Dispose(); $__ms.Dispose() }',
+    '      } else {',
+    '        $__fs.Write($__blob, 0, $__blob.Length)',
+    '        $__w += $__blob.Length',
+    '      }',
+    '    }',
+    '  } finally { $__fs.Dispose() }',
+    '  $__a = [string]$__w',
+    '} catch {',
+    '  $__a = [string]$__a + [string]($_.Exception.Message)',
+    '  $__c = 1',
+    '}',
+    sq(ENVELOPE_MARKER) + ' + [string]$__c',
+    "'O:' + [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]$__a))",
+    "'E:' + [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]$__e))",
+    '',
+  ].join('\r\n')
+}
+
+/** Remote-side read buffer used by {@link psSendStream} while draining the file to stdout. */
+const SEND_BUFFER_BYTES = 262_144
+
+/**
+ * Streaming sender: write one byte range of the file to standard output,
+ * gzip-compressed, for the download path.
+ *
+ * This is the mirror of {@link psReceiveStream}. The old download path asked
+ * for 48 KiB at a time, and every chunk cost a full shell create / command /
+ * delete cycle — five HTTP round trips each — so a 2 MiB file took 129 s. Here
+ * the shell is created once and the client then simply receives; the only
+ * per-chunk cost left is one `Receive`, and the target streams the file as fast
+ * as the transport will drain it.
+ *
+ * Two details make this work:
+ *
+ * - **Only stderr may carry text.** Anything written to the PowerShell success
+ *   stream would be merged into the payload and corrupt the file, so the byte
+ *   count and any error go to `[Console]::Error` and the exit code, not stdout.
+ * - **The range is positional.** `Position` plus a byte count lets several
+ *   shells serve different parts of one file concurrently; each writes to its
+ *   own offset on the client, so completion order does not matter.
+ *
+ * Output is gzip-compressed unconditionally. Measured against this target, a
+ * compressible 16 MiB file collapsed from 121 round trips to 1 (2.0 s), and an
+ * incompressible 2 MiB file was no slower than raw (9457 ms vs 9582 ms), so the
+ * compression pays for itself or costs nothing.
+ * @param remotePath - file to read on the target.
+ * @param start - first byte offset of this worker's range.
+ * @param length - number of bytes this worker must send.
+ * @returns a PowerShell script suitable for `-EncodedCommand`.
+ */
+export function psSendStream(remotePath: string, start: number, length: number): string {
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    '$__o = [Console]::OpenStandardOutput()',
+    '$__n = 0',
+    'try {',
+    '  $__fs = [System.IO.File]::OpenRead(' + sq(remotePath) + ')',
+    '  try {',
+    '    $__fs.Position = [long]' + String(start),
+    '    $__left = [long]' + String(length),
+    '    $__gz = New-Object System.IO.Compression.GZipStream($__o, [System.IO.Compression.CompressionMode]::Compress, $true)',
+    '    try {',
+    '      $__buf = New-Object byte[] ' + String(SEND_BUFFER_BYTES),
+    '      while ($__left -gt 0) {',
+    '        $__want = [int][Math]::Min([long]$__buf.Length, $__left)',
+    '        $__k = $__fs.Read($__buf, 0, $__want)',
+    '        if ($__k -le 0) { break }',
+    '        $__gz.Write($__buf, 0, $__k)',
+    '        $__n += $__k',
+    '        $__left -= $__k',
+    '      }',
+    '      $__gz.Flush()',
+    '    } finally { $__gz.Dispose() }',
+    '    $__o.Flush()',
+    '  } finally { $__fs.Dispose() }',
+    "  [Console]::Error.WriteLine('__DSH_DL__ OK ' + [string]$__n)",
+    '} catch {',
+    "  [Console]::Error.WriteLine('__DSH_DL__ ERR ' + [string]($_.Exception.Message))",
+    '  throw',
+    '}',
+    '',
+  ].join('\r\n')
+}
+
+/**
+ * Wrap an arbitrary script in the constant powershell.exe invocation.
+ *
+ * Only safe for scripts that fit cmd.exe's ~8191 character command line (the
+ * script is base64-of-UTF-16 on the wire, so it costs 2.67 characters each);
+ * {@link psReceiveStream} outgrew that and travels on stdin instead.
+ * @param script - the PowerShell script to run.
+ * @returns the command line to hand to WinRS.
+ */
+export function scriptCommandLine(script: string): string {
+  return 'powershell.exe -NoProfile -NoLogo -ExecutionPolicy Bypass -EncodedCommand ' + encodeCommand(script)
 }
 
 /** Decode one base64 envelope field, tolerating whitespace the transport added. */

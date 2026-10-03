@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { adminSharePath } from '../src/smb.ts'
+import { adminSharePath, smbUnavailable } from '../src/smb.ts'
 
 test('admin share path conversion handles drives and backslashes', () => {
   assert.equal(adminSharePath('server1', 'D:\\AIpro\\site\\app.dll'), '\\\\server1\\D$\\AIpro\\site\\app.dll')
@@ -10,4 +10,10 @@ test('admin share path conversion handles drives and backslashes', () => {
 test('admin share path rejects non-drive paths', () => {
   assert.throws(() => adminSharePath('server1', 'relative/path.txt'), /absolute remote path/)
   assert.throws(() => adminSharePath('server1', '\\\\other\\share\\file'), /absolute remote path/)
+})
+
+test('smbUnavailable names the host and the port that must be open', () => {
+  const error = smbUnavailable('server1')
+  assert.match(error.message, /server1:445/)
+  assert.match(error.message, /TCP 445/)
 })

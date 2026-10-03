@@ -272,7 +272,7 @@ export function winrmUploadTool(engine: WinRmEngine) {
       alias: { type: 'string', required: true, description: 'Host alias from winrm_list.' },
       localPath: { type: 'string', required: true, description: 'Absolute local file path on this machine.' },
       remotePath: { type: 'string', required: true, description: 'Destination path on the remote host, e.g. C:\\temp\\file.txt (parent dirs are created).' },
-      channel: { type: 'string', enum: ['auto', 'smb', 'winrm'], description: 'Transfer channel: smb (admin share), winrm (base64 chunks), or auto (default, SMB first with WinRM fallback).' },
+      channel: { type: 'string', enum: ['auto', 'smb', 'winrm'], description: 'Transfer channel: smb (admin share), winrm (streamed over the WinRS stdin channel), or auto (default, SMB first with WinRM fallback).' },
     },
     output: {
       schema: {
@@ -311,7 +311,7 @@ export function winrmDownloadTool(engine: WinRmEngine) {
       alias: { type: 'string', required: true, description: 'Host alias from winrm_list.' },
       remotePath: { type: 'string', required: true, description: 'Remote file path, e.g. C:\\temp\\file.txt.' },
       localPath: { type: 'string', required: true, description: 'Absolute destination path on this machine.' },
-      channel: { type: 'string', enum: ['auto', 'smb', 'winrm'], description: 'Transfer channel: smb (admin share), winrm (base64 chunks), or auto (default, SMB first with WinRM fallback).' },
+      channel: { type: 'string', enum: ['auto', 'smb', 'winrm'], description: 'Transfer channel: smb (admin share), winrm (streamed over parallel WinRS ranges), or auto (default, SMB first with WinRM fallback).' },
     },
     output: {
       schema: {

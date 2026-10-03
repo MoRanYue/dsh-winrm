@@ -1,15 +1,15 @@
 /**
  * The WinRM engine facade: host lookup, PowerShell exec (UTF-8 envelope),
- * service & process management, directory listing, base64-chunked file
- * transfer, cluster execution and the streaming console. The heavy lifting
- * lives in engine/ (client, console); this class composes them behind one
- * WinRmEngine instance per plugin apply.
+ * service & process management, directory listing, file transfer, cluster
+ * execution and the streaming console. The heavy lifting lives in engine/
+ * (client, console); this class composes them behind one WinRmEngine instance
+ * per plugin apply.
  */
 
 import type { ClusterResult, ExecResult, ProcessInfo, RemoteDirEntry, ServiceInfo, TestResult, TransferProgress, WinHostSummary } from './protocol.ts'
 import type { HostStore } from './store.ts'
-import { connOf, downloadChunks, runScript, testConnection, uploadBuffer } from './engine/client.ts'
-import { downloadSmb, uploadSmb, type TransferChannel } from './smb.ts'
+import { connOf, downloadChunks, downloadStream, runScript, testConnection, uploadBuffer, uploadStream } from './engine/client.ts'
+import { downloadSmb, smbReachable, smbUnavailable, uploadSmb, type TransferChannel } from './smb.ts'
 import { ConsoleSession } from './engine/console.ts'
 import { psKillProcess, psListDir, psListProcesses, psListServices, psServiceAction } from './powershell.ts'
 
@@ -244,18 +244,31 @@ export class WinRmEngine {
     return this.gate.run(alias, async () => {
       onProgress?.({ phase: 'connecting', file: remotePath, transferred: 0, total: data.length, percent: 0 })
       if (channel !== 'winrm') {
-        try {
-          const outcome = await uploadSmb(entry, localPath, remotePath)
-          onProgress?.({ phase: 'done', file: remotePath, transferred: outcome.bytes, total: outcome.bytes, percent: 100 })
-          return { bytes: outcome.bytes, channel: outcome.channel }
-        } catch (error) {
-          if (channel === 'smb') throw error
-          onProgress?.({ phase: 'connecting', file: remotePath, transferred: 0, total: data.length, percent: 0 })
+        // Probe 445 first: `net use` takes ~60 s to fail against a host whose
+        // SMB is down, and on `auto` that delay landed before every upload.
+        if (await smbReachable(entry.host)) {
+          try {
+            const outcome = await uploadSmb(entry, localPath, remotePath)
+            onProgress?.({ phase: 'done', file: remotePath, transferred: outcome.bytes, total: outcome.bytes, percent: 100 })
+            return { bytes: outcome.bytes, channel: outcome.channel }
+          } catch (error) {
+            if (channel === 'smb') throw error
+            onProgress?.({ phase: 'connecting', file: remotePath, transferred: 0, total: data.length, percent: 0 })
+          }
+        } else if (channel === 'smb') {
+          throw smbUnavailable(entry.host)
         }
       }
-      const bytes = await uploadBuffer(connOf(entry), remotePath, data, (transferred, total) => {
+      // WinRM transport: the streaming path moves the file over a single
+      // stdin stream (one shell, one Send per 256 KiB). It returns null when
+      // the transport it borrows is unavailable, in which case the chunked
+      // path still works — just far more slowly.
+      const conn = connOf(entry)
+      const report = (transferred: number, total: number): void => {
         onProgress?.({ phase: 'transferring', file: remotePath, transferred, total, percent: total > 0 ? Math.round((transferred / total) * 1000) / 10 : 0 })
-      })
+      }
+      let bytes = await uploadStream(conn, remotePath, data, report)
+      if (bytes === null) bytes = await uploadBuffer(conn, remotePath, data, report)
       onProgress?.({ phase: 'done', file: remotePath, transferred: bytes, total: bytes, percent: 100 })
       return { bytes, channel: 'winrm' }
     })
@@ -268,34 +281,85 @@ export class WinRmEngine {
     return this.gate.run(alias, async () => {
       onProgress?.({ phase: 'connecting', file: remotePath, transferred: 0, total: 0, percent: 0 })
       if (channel !== 'winrm') {
-        try {
-          const outcome = await downloadSmb(entry, remotePath, localPath)
-          onProgress?.({ phase: 'done', file: remotePath, transferred: outcome.bytes, total: outcome.bytes, percent: 100 })
-          return { bytes: outcome.bytes, channel: outcome.channel }
-        } catch (error) {
-          if (channel === 'smb') throw error
-          onProgress?.({ phase: 'connecting', file: remotePath, transferred: 0, total: 0, percent: 0 })
+        // Same 445 probe as upload: `net use` has no short timeout of its own.
+        if (await smbReachable(entry.host)) {
+          try {
+            const outcome = await downloadSmb(entry, remotePath, localPath)
+            onProgress?.({ phase: 'done', file: remotePath, transferred: outcome.bytes, total: outcome.bytes, percent: 100 })
+            return { bytes: outcome.bytes, channel: outcome.channel }
+          } catch (error) {
+            if (channel === 'smb') throw error
+            onProgress?.({ phase: 'connecting', file: remotePath, transferred: 0, total: 0, percent: 0 })
+          }
+        } else if (channel === 'smb') {
+          throw smbUnavailable(entry.host)
         }
       }
-      const { createWriteStream } = await import('node:fs')
-      const sink = createWriteStream(localPath, { mode: 0o600 })
+      const { open, rm } = await import('node:fs/promises')
+      // The destination is opened on the first write rather than up front, so a
+      // download that fails its size probe (a path that does not exist, a
+      // directory, an unreachable host) does not leave a truncated empty file
+      // behind as evidence that it succeeded.
+      let sink: Awaited<ReturnType<typeof open>> | null = null
+      let completed = false
       let bytes = 0
-      await new Promise<void>((resolve, reject) => {
-        sink.on('error', reject)
-        void downloadChunks(
-          connOf(entry),
-          remotePath,
-          (b64) => {
-            const buffer = Buffer.from(b64, 'base64')
-            bytes += buffer.length
-            sink.write(buffer)
-          },
-          (transferred, total) => onProgress?.({ phase: 'transferring', file: remotePath, transferred, total, percent: total > 0 ? Math.round((transferred / total) * 1000) / 10 : 0 }),
-        ).then(
-          () => sink.end(resolve),
-          (error) => { sink.destroy(); reject(error) },
-        )
-      })
+      // Positional writes: the ranges arrive out of order and each piece knows
+      // its own offset, so a sequential stream would need full reassembly in
+      // memory first. pwrite keeps memory bounded by one Receive response.
+      // Writes are chained rather than fired loose: the handle must not close
+      // while a write is still in flight, and chaining bounds the pending work
+      // to a single write no matter how large the file is. A rejected write
+      // propagates down the chain and surfaces once at the final await.
+      let queue: Promise<void> = Promise.resolve()
+      const put = (offset: number, data: Buffer): void => {
+        bytes += data.length
+        queue = queue.then(async () => {
+          if (sink === null) sink = await open(localPath, 'w', 0o600)
+          const handle = sink
+          await handle.write(data, 0, data.length, offset)
+        })
+        // A failed write must not be reported as an unhandled rejection while
+        // the transfer is still running: the rejection is re-raised by the
+        // final await below, which is where the caller can act on it.
+        void queue.catch(() => undefined)
+      }
+      const report = (transferred: number, total: number): void => {
+        onProgress?.({ phase: 'transferring', file: remotePath, transferred, total, percent: total > 0 ? Math.round((transferred / total) * 1000) / 10 : 0 })
+      }
+      try {
+        const conn = connOf(entry)
+        const streamed = await downloadStream(conn, remotePath, put, report)
+        if (streamed === null) {
+          let offset = 0
+          await downloadChunks(
+            conn,
+            remotePath,
+            (b64) => {
+              const buffer = Buffer.from(b64, 'base64')
+              put(offset, buffer)
+              offset += buffer.length
+            },
+            report,
+          )
+        }
+        await queue
+        // A zero-byte remote file produces no writes, so the sink is still
+        // unopened; create the file rather than finishing with nothing on disk.
+        if (sink === null) sink = await open(localPath, 'w', 0o600)
+        completed = true
+      } finally {
+        // `downloadStream` stops its workers from emitting before it settles,
+        // but a write already handed to the queue may still be in flight. Let
+        // it finish before the handle closes, or it lands on a closed file as
+        // an unhandled rejection that takes the whole process down.
+        await queue.catch(() => undefined)
+        if (sink !== null) await sink.close()
+        // A transfer that failed partway would otherwise leave a truncated file
+        // that looks exactly like a finished download. Removing it is safe even
+        // though it may have overwritten a previous file, because the 'w' open
+        // already truncated that file to nothing.
+        if (!completed && sink !== null) await rm(localPath, { force: true }).catch(() => undefined)
+      }
       onProgress?.({ phase: 'done', file: remotePath, transferred: bytes, total: bytes, percent: 100 })
       return { bytes, channel: 'winrm' }
     })
