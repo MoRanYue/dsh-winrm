@@ -266,7 +266,7 @@ export function winrmProcessTool(engine: WinRmEngine) {
 export function winrmUploadTool(engine: WinRmEngine) {
   return defineTool({
     name: 'winrm_upload',
-    description: 'Upload a local file to a configured Windows host (SMB admin share preferred, base64 WinRM chunk fallback). The local path is on THIS machine (the dsh host). ' +
+    description: 'Upload a local file to a configured Windows host. The bytes go over the SMB admin share when it is reachable, otherwise they are streamed over WinRM in one shell with per-chunk gzip (the 48 KiB base64 chunk path is kept only as a fallback). The local path is on THIS machine (the dsh host). ' +
       'Triggers: upload file to Windows server, deploy artifact, copy config to Windows server.',
     parameters: {
       alias: { type: 'string', required: true, description: 'Host alias from winrm_list.' },
@@ -305,7 +305,7 @@ export function winrmUploadTool(engine: WinRmEngine) {
 export function winrmDownloadTool(engine: WinRmEngine) {
   return defineTool({
     name: 'winrm_download',
-    description: 'Download a remote FILE from a configured Windows host to a local path on this machine (SMB admin share preferred, base64 WinRM chunk fallback). Directory download is not supported — download files individually. ' +
+    description: 'Download a remote FILE from a configured Windows host to a local path on this machine. The bytes come over the SMB admin share when it is reachable, otherwise they are streamed over WinRM as parallel byte ranges (the 48 KiB base64 chunk path is kept only as a fallback). Directory download is not supported — download files individually. ' +
       'Triggers: download file from Windows server, fetch remote log/artifact.',
     parameters: {
       alias: { type: 'string', required: true, description: 'Host alias from winrm_list.' },
