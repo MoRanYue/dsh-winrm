@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.1 - 2026-10-05
+
+Documentation only. The 0.3.0 tarball still described file transfer the way it
+worked before the streaming rewrite, and those strings are what the model reads
+when it decides whether to set `channel`.
+
+### Fixed
+
+- **`winrm_upload` and `winrm_download` no longer advertise a path the code stopped taking.** Both tool descriptions said "SMB admin share preferred, base64 WinRM chunk fallback", which was true of 0.2.x. Since 0.3.0 the bytes are streamed over WinRM (one shell with per-chunk gzip on upload, parallel byte ranges on download) and the 48 KiB base64 chunk path is only a fallback when the streaming channel is unavailable. `channel` was already documented correctly; the summary line above it contradicted it.
+- The `WINRM_GUIDANCE` system-prompt section called transfer "base64 分块，无 SMB 依赖". It now describes the actual order: SMB admin share when reachable, otherwise WinRM streaming, with sha256 verification for large files.
+- The `src/index.ts` header comment said the plugin reads config live "so the Settings page can flip `enabled` / `announceToAgent`". No shipped client builds a settings page from a schema — the harness's own `packages/settings/settings/README.md` says so — and a plugin's config UI belongs to the plugin-manager page. The comment now says those fields are edited in the profile.
+
 ## 0.3.0 - 2026-10-03
 
 File transfers no longer pay a full shell lifecycle per 48 KiB chunk, in either
