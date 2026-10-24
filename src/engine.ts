@@ -6,18 +6,66 @@
  * per plugin apply.
  */
 
-import type { ClusterResult, ExecResult, ProcessInfo, RemoteDirEntry, ServiceInfo, TestResult, TransferProgress, WinHostSummary } from './protocol.ts'
+import type { ClusterResult, ExecResult, ProcessInfo, RemoteDirEntry, RemoteEditOutcome, RemoteTextEncoding, RemoteTextWindow, RemoteWriteOutcome, ServiceInfo, TestResult, TransferProgress, WinHostSummary } from './protocol.ts'
 import type { HostStore } from './store.ts'
-import { connOf, downloadChunks, downloadStream, runScript, testConnection, uploadBuffer, uploadStream } from './engine/client.ts'
+import { connOf, downloadChunks, downloadStream, remoteFileSize, runScript, testConnection, uploadBuffer, uploadStream } from './engine/client.ts'
 import { downloadSmb, smbReachable, smbUnavailable, uploadSmb, type TransferChannel } from './smb.ts'
 import { ConsoleSession } from './engine/console.ts'
-import { psKillProcess, psListDir, psListProcesses, psListServices, psServiceAction } from './powershell.ts'
+import { psEditText, psKillProcess, psListDir, psListProcesses, psListServices, psReadTextWindow, psServiceAction } from './powershell.ts'
+
+/** Longest single line the reader returns before cutting it (characters). */
+export const READ_MAX_LINE_LENGTH = 2_000
+
+/** Lines the reader returns when the caller does not choose a page size. */
+export const READ_DEFAULT_LIMIT = 2_000
+
+/** Most lines the reader will return in one call. */
+export const READ_MAX_LIMIT = 5_000
+
+/** Byte budget for one read window; keeps the envelope well under the transport limit. */
+export const READ_MAX_BYTES = 512 * 1_024
 
 /** JSON-safe parse of the envelope output into a typed value. */
 function parseJson<T>(text: string): T {
   const trimmed = text.trim()
   if (trimmed === '' || trimmed === 'null') return [] as unknown as T
   return JSON.parse(trimmed) as T
+}
+
+/**
+ * Parse one JSON object out of an envelope's stdout.
+ *
+ * The file tools report their own failures inside the JSON (`{"error":…}`)
+ * with exit code 0, so an unparseable body means the fragment never ran;
+ * returning undefined lets the caller say so instead of throwing a
+ * `SyntaxError` with no context.
+ * @param text - envelope stdout.
+ * @returns the parsed object, or undefined when the body is empty or not JSON.
+ */
+function parseObject<T>(text: string): T | undefined {
+  const trimmed = text.trim()
+  if (trimmed === '' || trimmed === 'null') return undefined
+  if (!trimmed.startsWith('{')) return undefined
+  try {
+    return JSON.parse(trimmed) as T
+  } catch {
+    return undefined
+  }
+}
+
+/** Mark an over-long line the reader cut, so the model knows it is incomplete. */
+function annotateCutLine(text: string): string {
+  return text.length > READ_MAX_LINE_LENGTH
+    ? `${text.slice(0, READ_MAX_LINE_LENGTH)}… (line truncated to ${READ_MAX_LINE_LENGTH} chars)`
+    : text
+}
+
+/** Encode text for a remote write, applying the requested byte-order mark. */
+function encodeText(content: string, encoding: RemoteTextEncoding): Buffer {
+  const body = Buffer.from(content, 'utf8')
+  if (encoding === 'utf8bom') return Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), body])
+  if (encoding === 'utf16le') return Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(content, 'utf16le')])
+  return body
 }
 
 /** A tiny per-alias in-flight limiter so GUI bursts do not pile up sockets. */
@@ -230,6 +278,132 @@ export class WinRmEngine {
         size: item.size ?? 0,
         mtimeMs: item.mtimeMs ?? 0,
       }))
+    })
+  }
+
+  // ------------------------------------------------------------------ text
+
+  /**
+   * Read a bounded, line-numbered window of a remote text file.
+   *
+   * One PowerShell round trip: the remote side decodes the file, counts every
+   * line, and returns only the requested window, so a large log costs one
+   * transfer of the window rather than of the file.
+   * @param alias - configured host.
+   * @param remotePath - path on the target.
+   * @param offset - 1-based first line to return.
+   * @param limit - maximum number of lines to return.
+   * @returns the window plus the file's total line count and encoding.
+   */
+  async readFile(alias: string, remotePath: string, offset: number, limit: number): Promise<RemoteTextWindow> {
+    const entry = this.store.find(alias)
+    if (entry === undefined) throw new Error(`alias '${alias}' not found`)
+    return this.gate.run(alias, async () => {
+      const result = await runScript(
+        connOf(entry),
+        psReadTextWindow(remotePath, offset, limit, READ_MAX_LINE_LENGTH, READ_MAX_BYTES),
+        { timeoutMs: 120_000 },
+      )
+      const payload = parseObject<{
+        exists?: boolean
+        error?: string
+        size?: number
+        encoding?: string
+        totalLines?: number
+        lineCount?: number
+        truncated?: boolean
+        linesText?: string
+      }>(result.stdout)
+      if (payload === undefined) {
+        throw new Error(result.stderr.trim() || result.stdout.trim() || `failed to read '${remotePath}'`)
+      }
+      if (payload.error !== undefined) {
+        throw new Error(`${remotePath}: ${payload.error} (the reader decodes UTF-8 and UTF-16 with a BOM; a binary file has no line structure to show)`)
+      }
+      if (payload.exists !== true) throw new Error(`remote file not found: ${remotePath}`)
+      const totalLines = payload.totalLines ?? 0
+      const lineCount = payload.lineCount ?? 0
+      // `truncated` also covers the byte budget, in which case the offset may
+      // legitimately point past what this window reached.
+      if (payload.truncated !== true && offset > totalLines && totalLines > 0) {
+        throw new Error(`offset ${offset} is out of range for '${remotePath}' (${totalLines} lines)`)
+      }
+      const texts = lineCount === 0 ? [] : (payload.linesText ?? '').split('\n')
+      return {
+        path: remotePath,
+        offset,
+        lines: texts.map((text, index) => ({ number: offset + index, text: annotateCutLine(text) })),
+        totalLines,
+        encoding: payload.encoding ?? 'utf8',
+        truncatedByBytes: payload.truncated === true,
+      }
+    })
+  }
+
+  /**
+   * Write a whole remote text file, creating parent directories as needed.
+   *
+   * Reuses the transfer transport (single streamed stdin when available, the
+   * 48 KiB chunk path otherwise) so a large write does not pay one shell cycle
+   * per chunk.
+   * @param alias - configured host.
+   * @param remotePath - path on the target; overwritten when it exists.
+   * @param content - UTF-8 text to write.
+   * @param encoding - byte-order mark to emit (`utf8`, `utf8bom`, `utf16le`).
+   * @returns the operation kind, byte count and encoding actually written.
+   */
+  async writeFile(alias: string, remotePath: string, content: string, encoding: RemoteTextEncoding): Promise<RemoteWriteOutcome> {
+    const entry = this.store.find(alias)
+    if (entry === undefined) throw new Error(`alias '${alias}' not found`)
+    const data = encodeText(content, encoding)
+    return this.gate.run(alias, async () => {
+      const conn = connOf(entry)
+      const before = await remoteFileSize(conn, remotePath)
+      let bytes = await uploadStream(conn, remotePath, data)
+      if (bytes === null) bytes = await uploadBuffer(conn, remotePath, data)
+      return { path: remotePath, operation: before === null ? 'create' : 'update', bytes, encoding }
+    })
+  }
+
+  /**
+   * Replace `oldString` with `newString` inside a remote text file.
+   *
+   * The replacement is literal, never a pattern, and the file's existing
+   * encoding is preserved. Without `replaceAll` the edit is refused unless the
+   * needle is unique, so a stale needle cannot rewrite the wrong region.
+   * @param alias - configured host.
+   * @param remotePath - path on the target.
+   * @param oldString - exact text to find.
+   * @param newString - text to substitute.
+   * @param replaceAll - replace every occurrence instead of requiring one.
+   * @returns the replacement count and the file's new size.
+   */
+  async editFile(
+    alias: string,
+    remotePath: string,
+    oldString: string,
+    newString: string,
+    replaceAll: boolean,
+  ): Promise<RemoteEditOutcome> {
+    const entry = this.store.find(alias)
+    if (entry === undefined) throw new Error(`alias '${alias}' not found`)
+    if (oldString === '') throw new Error('oldString must be a non-empty string')
+    if (oldString === newString) throw new Error('oldString and newString are identical; nothing to change')
+    const oldB64 = Buffer.from(oldString, 'utf8').toString('base64')
+    const newB64 = Buffer.from(newString, 'utf8').toString('base64')
+    return this.gate.run(alias, async () => {
+      const result = await runScript(connOf(entry), psEditText(remotePath, oldB64, newB64, replaceAll), { timeoutMs: 120_000 })
+      const payload = parseObject<{ error?: string; path?: string; encoding?: string; replacements?: number; size?: number }>(result.stdout)
+      if (payload === undefined) {
+        throw new Error(result.stderr.trim() || result.stdout.trim() || `failed to edit '${remotePath}'`)
+      }
+      if (payload.error !== undefined) throw new Error(payload.error)
+      return {
+        path: payload.path ?? remotePath,
+        encoding: payload.encoding ?? 'utf8',
+        replacements: payload.replacements ?? 0,
+        size: payload.size ?? 0,
+      }
     })
   }
 

@@ -3,8 +3,9 @@
  * execution with a UTF-8 envelope, streaming console, service/process
  * management, streamed file transfer, cluster), the /api/dsh-winrm
  * route family plus the console WebSocket upgrade, the agent tools
- * (winrm_list, winrm_exec, winrm_service, winrm_process, winrm_upload,
- * winrm_download, winrm_cluster), and a system-prompt announcement. The
+ * (winrm_list, winrm_exec, winrm_service, winrm_process, winrm_read,
+ * winrm_write, winrm_edit, winrm_upload, winrm_download, winrm_cluster), and
+ * a system-prompt announcement. The
  * browser half (./client) renders the host manager and operations panel.
  * Everything rides official NPM SDK packages — no dsh source changes.
  *
@@ -27,11 +28,14 @@ import { HostStore } from './store.ts'
 import {
   winrmClusterTool,
   winrmDownloadTool,
+  winrmEditTool,
   winrmExecTool,
   winrmListTool,
   winrmProcessTool,
+  winrmReadTool,
   winrmServiceTool,
   winrmUploadTool,
+  winrmWriteTool,
 } from './tools.ts'
 import { mountOnce } from './mount-once.ts'
 
@@ -64,7 +68,7 @@ const DEFAULT_ENABLED = true
 const SECTION_ORDER = 151
 
 /** Model-facing announcement: plugin presence, capabilities, and limits. */
-export const WINRM_GUIDANCE = '本机已安装 dsh-winrm 插件（DSH 远程 Windows 运维，WinRM/PowerShell Remoting）：侧边栏「Windows」入口；仿照 dsh-ssh 插件开发。能力：主机配置存 ~/.dsh/dsh-winrm.json（GUI 配置后 agent 方可使用）；winrm_list 列出主机、winrm_exec 执行 PowerShell 命令（UTF-8 信封，中文不乱码）、winrm_service 服务管理（start/stop/restart/启动类型）、winrm_process 进程管理（list/kill）、winrm_upload/winrm_download 文件传输（SMB 管理共享可达时优先，否则走 WinRM 流式传输，无 SMB 依赖，大文件经 SHA256 校验）、winrm_cluster 集群并发执行；Web 控制台走 WebSocket。认证：通过原生 Node.js WinRM 客户端（winrm-client）的 NTLM/Negotiate 与 Basic 实现，兼容本地账户与域账户；传输支持 http(5985)/https(5986)。前提：目标机需启用 WinRM（scripts/enable-winrm.ps1），本机无需 Python —— WinRM 走纯 Node 依赖。HTTP 仅建议受信内网使用；密码以明文存在用户主目录私有文件（权限 0600）；命令输出可能含敏感信息；传输/执行消耗真实远程资源，先确认再操作。用户提到「Windows 服务器 / WinRM / PowerShell 远程 / 服务管理 / 进程管理」时即指本插件，请据此协作。'
+export const WINRM_GUIDANCE = '本机已安装 dsh-winrm 插件（DSH 远程 Windows 运维，WinRM/PowerShell Remoting）：侧边栏「Windows」入口；仿照 dsh-ssh 插件开发。能力：主机配置存 ~/.dsh/dsh-winrm.json（GUI 配置后 agent 方可使用）；winrm_list 列出主机、winrm_exec 执行 PowerShell 命令（UTF-8 信封，中文不乱码）、winrm_service 服务管理（start/stop/restart/启动类型）、winrm_process 进程管理（list/kill）、winrm_read/winrm_write/winrm_edit 远程文本文件读写（按行分页、编码感知、精确串替换，作用于远端主机而非本机，本机文件仍用 read/write/edit）、winrm_upload/winrm_download 文件传输（SMB 管理共享可达时优先，否则走 WinRM 流式传输，无 SMB 依赖，大文件经 SHA256 校验）、winrm_cluster 集群并发执行；Web 控制台走 WebSocket。认证：通过原生 Node.js WinRM 客户端（winrm-client）的 NTLM/Negotiate 与 Basic 实现，兼容本地账户与域账户；传输支持 http(5985)/https(5986)。前提：目标机需启用 WinRM（scripts/enable-winrm.ps1），本机无需 Python —— WinRM 走纯 Node 依赖。HTTP 仅建议受信内网使用；密码以明文存在用户主目录私有文件（权限 0600）；命令输出可能含敏感信息；传输/执行消耗真实远程资源，先确认再操作。用户提到「Windows 服务器 / WinRM / PowerShell 远程 / 服务管理 / 进程管理」时即指本插件，请据此协作。'
 
 /**
  * Mount the WinRM engine, routes, tools, and announcement.
@@ -88,6 +92,9 @@ function applyImpl(ctx: Context, config?: Config): void {
     winrmExecTool(engine),
     winrmServiceTool(engine),
     winrmProcessTool(engine),
+    winrmReadTool(engine),
+    winrmWriteTool(engine),
+    winrmEditTool(engine),
     winrmUploadTool(engine),
     winrmDownloadTool(engine),
     winrmClusterTool(engine),

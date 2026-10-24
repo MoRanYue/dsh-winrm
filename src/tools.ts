@@ -6,7 +6,7 @@
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
-import type { WinRmEngine } from './engine.ts'
+import { READ_DEFAULT_LIMIT, READ_MAX_LIMIT, type WinRmEngine } from './engine.ts'
 import type { ClusterResult, ExecResult, WinHostSummary } from './protocol.ts'
 
 /** One text content block (the only render shape these tools emit). */
@@ -383,6 +383,172 @@ export function winrmClusterTool(engine: WinRmEngine) {
     },
     async execute(args) {
       return { results: await engine.cluster(args) }
+    },
+  })
+}
+
+/** Render a read window in the numbered envelope the local read tool uses. */
+function renderWindow(window: {
+  path?: string
+  offset?: number
+  lines?: Array<{ number: number; text: string }>
+  totalLines?: number
+  truncatedByBytes?: boolean
+}): string {
+  const lines = window.lines ?? []
+  const offset = window.offset ?? 1
+  const total = window.totalLines ?? 0
+  const last = offset + lines.length - 1
+  const body = lines.map(line => `${line.number}: ${line.text}`).join('\n')
+  let footer: string
+  if (lines.length === 0) {
+    footer = total === 0
+      ? '(End of file - total 0 lines)'
+      : `(No lines at offset ${offset}; the file has ${total} lines.)`
+  } else if (window.truncatedByBytes === true) {
+    footer = `(Showing lines ${offset}-${last} of ${total}. The window stopped at the byte budget — continue with offset=${last + 1}.)`
+  } else if (last < total) {
+    footer = `(Showing lines ${offset}-${last} of ${total}. Continue with offset=${last + 1}.)`
+  } else {
+    footer = `(End of file - total ${total} lines)`
+  }
+  const content = body === '' ? footer : `${body}\n\n${footer}`
+  return [`<path>${window.path ?? ''}</path>`, '<type>file</type>', '<content>', content, '</content>'].join('\n')
+}
+
+/** The remote read tool: a line-numbered window of a text file on the target. */
+export function winrmReadTool(engine: WinRmEngine) {
+  return defineTool({
+    name: 'winrm_read',
+    description: 'Read a text file ON A REMOTE Windows host and return its content line-numbered. The path is on the Windows host, not this machine — use `read` for local files. Decodes UTF-8 (with or without BOM) and UTF-16 with a BOM, and refuses binary files instead of returning mojibake. Page through large files with offset and limit. ' +
+      'Triggers: read file on Windows server, inspect remote config/log/script.',
+    parameters: {
+      alias: { type: 'string', required: true, description: 'Host alias from winrm_list.' },
+      remotePath: { type: 'string', required: true, description: 'Path on the remote host, e.g. C:\\temp\\app.log.' },
+      offset: { type: 'integer', description: '1-based first line to return. Defaults to 1.' },
+      limit: { type: 'integer', description: `Maximum lines to return (default ${READ_DEFAULT_LIMIT}, max ${READ_MAX_LIMIT}).` },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+          path: { type: 'string' },
+          offset: { type: 'integer' },
+          lines: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                number: { type: 'integer', required: true },
+                text: { type: 'string', required: true },
+              },
+            },
+          },
+          totalLines: { type: 'integer' },
+          encoding: { type: 'string' },
+          truncatedByBytes: { type: 'boolean' },
+          error: { type: 'string' },
+        },
+      },
+      render: (_args, value: { ok: boolean; path?: string; offset?: number; lines?: Array<{ number: number; text: string }>; totalLines?: number; truncatedByBytes?: boolean; error?: string }) => text(value.ok
+        ? renderWindow(value)
+        : `read failed: ${value.error ?? 'unknown error'}`),
+    },
+    async execute(args) {
+      const offset = Math.max(1, Math.trunc(args.offset ?? 1))
+      const limit = Math.min(READ_MAX_LIMIT, Math.max(1, Math.trunc(args.limit ?? READ_DEFAULT_LIMIT)))
+      try {
+        const window = await engine.readFile(args.alias, args.remotePath, offset, limit)
+        return { ok: true, ...window }
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) }
+      }
+    },
+  })
+}
+
+/** The remote write tool: replace a whole text file on the target. */
+export function winrmWriteTool(engine: WinRmEngine) {
+  return defineTool({
+    name: 'winrm_write',
+    description: 'Write a text file ON A REMOTE Windows host, creating parent directories and overwriting any existing file. The path is on the Windows host, not this machine — use `write` for local files, and prefer winrm_edit when only part of an existing file changes. Line endings are sent verbatim, so include \\r\\n for a Windows-native file. ' +
+      'Triggers: write file on Windows server, create remote script/config, overwrite remote file.',
+    parameters: {
+      alias: { type: 'string', required: true, description: 'Host alias from winrm_list.' },
+      remotePath: { type: 'string', required: true, description: 'Destination path on the remote host, e.g. C:\\temp\\script.ps1 (parent dirs are created).' },
+      content: { type: 'string', required: true, description: 'Full file content.' },
+      encoding: { type: 'string', enum: ['utf8', 'utf8bom', 'utf16le'], description: 'Byte-order mark to emit: utf8 (default, no BOM), utf8bom, or utf16le (PowerShell 5.1 reads a BOM-less script as ANSI, so non-ASCII script text needs a BOM).' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+          path: { type: 'string' },
+          operation: { type: 'string', enum: ['create', 'update'] },
+          bytes: { type: 'integer' },
+          encoding: { type: 'string', enum: ['utf8', 'utf8bom', 'utf16le'] },
+          error: { type: 'string' },
+        },
+      },
+      render: (_args, value: { ok: boolean; path?: string; operation?: string; bytes?: number; error?: string }) => text(value.ok
+        ? [`<path>${value.path ?? ''}</path>`, '<type>file</type>', '<content>', `${value.operation === 'update' ? 'Updated' : 'Created'} file (${value.bytes ?? 0} bytes)`, '</content>'].join('\n')
+        : `write failed: ${value.error ?? 'unknown error'}`),
+    },
+    async execute(args) {
+      try {
+        const outcome = await engine.writeFile(args.alias, args.remotePath, args.content, args.encoding ?? 'utf8')
+        return { ok: true, ...outcome }
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) }
+      }
+    },
+  })
+}
+
+/** The remote edit tool: replace an exact string inside a file on the target. */
+export function winrmEditTool(engine: WinRmEngine) {
+  return defineTool({
+    name: 'winrm_edit',
+    description: 'Replace an exact string in a text file ON A REMOTE Windows host, preserving the file encoding. The path is on the Windows host, not this machine — use `edit` for local files. `oldString` must match the file byte for byte, including indentation and line endings, and must be unique unless `replaceAll` is set; read the file with winrm_read first. ' +
+      'Triggers: edit file on Windows server, patch remote config, change remote script.',
+    parameters: {
+      alias: { type: 'string', required: true, description: 'Host alias from winrm_list.' },
+      remotePath: { type: 'string', required: true, description: 'Path on the remote host, e.g. C:\\temp\\app.config.' },
+      oldString: { type: 'string', required: true, description: 'Exact text to replace. Must not be empty.' },
+      newString: { type: 'string', required: true, description: 'Replacement text. Must differ from oldString.' },
+      replaceAll: { type: 'boolean', description: 'Replace every occurrence instead of requiring exactly one. Defaults to false.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+          path: { type: 'string' },
+          encoding: { type: 'string' },
+          replacements: { type: 'integer' },
+          size: { type: 'integer' },
+          error: { type: 'string' },
+        },
+      },
+      render: (_args, value: { ok: boolean; path?: string; replacements?: number; size?: number; error?: string }) => text(value.ok
+        ? ((value.replacements ?? 0) > 1
+          ? `The file ${value.path ?? ''} has been updated. All ${value.replacements ?? 0} occurrences were successfully replaced.`
+          : `The file ${value.path ?? ''} has been updated successfully.`)
+        : `edit failed: ${value.error ?? 'unknown error'}`),
+    },
+    async execute(args) {
+      try {
+        const outcome = await engine.editFile(args.alias, args.remotePath, args.oldString, args.newString, args.replaceAll ?? false)
+        return { ok: true, ...outcome }
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) }
+      }
     },
   })
 }

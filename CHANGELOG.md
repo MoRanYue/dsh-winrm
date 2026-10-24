@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+Three agent tools that act on the target's text files, mirroring the harness's own
+`read` / `write` / `edit`. Until now the plugin could move bytes but could not
+read or change a remote config file without shelling out through `winrm_exec`.
+
+### Added
+
+- **`winrm_read`** returns a numbered window of a remote text file, in the same envelope the local `read` tool uses (`<path>`, `<type>`, `N: line`, `(End of file - total M lines)`). It pages server-side, so a 900 MB log costs one window of transfer rather than the whole file, and it reports the encoding it detected. Lines are capped at 2000 characters and the window at 512 KiB; either cap sets `truncatedByBytes`, and the footer then tells the caller to continue from `offset` instead of claiming the file ended.
+- **`winrm_write`** writes a whole remote text file, creating parent directories, and reports whether it created or updated. `encoding` selects `utf8`, `utf8bom` or `utf16le`; the byte count returned is the count actually written, so a BOM is visible to the caller. It reuses the transfer transport (streamed stdin when available, the chunk path otherwise), so a large write does not pay one shell cycle per chunk.
+- **`winrm_edit`** replaces an exact string, never a pattern, and preserves the file's existing encoding — a UTF-16 file stays UTF-16, a UTF-8 BOM is not silently dropped. Without `replaceAll` it refuses an ambiguous needle rather than guessing which occurrence the caller meant; that refusal is the whole point, since a stale needle silently rewriting the wrong region is the failure mode that looks like success.
+
+### Fixed
+
+- **A remote file read no longer reports a binary file as mojibake.** The reader decodes UTF-8 and UTF-16-with-BOM strictly, so a binary target fails with `Unable to translate bytes …` plus a note that the reader has no line structure to show, instead of returning U+FFFD soup that a model would then reason about. The error unwraps the .NET reflective wrapper so the message is the decoder's own.
+
 ## 0.3.1 - 2026-10-05
 
 Documentation only. The 0.3.0 tarball still described file transfer the way it

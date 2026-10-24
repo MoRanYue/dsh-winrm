@@ -11,10 +11,11 @@
 | 面 | 说明 |
 | --- | --- |
 | GUI 侧边栏「Windows」入口 | 居中面板：**主机** / **控制台** / **服务** / **进程** / **传输** 五个页签 |
-| Agent 工具 | `winrm_list` `winrm_exec` `winrm_service` `winrm_process` `winrm_upload` `winrm_download` `winrm_cluster` |
+| Agent 工具 | `winrm_list` `winrm_exec` `winrm_service` `winrm_process` `winrm_read` `winrm_write` `winrm_edit` `winrm_upload` `winrm_download` `winrm_cluster` |
 | PowerShell 控制台 | WebSocket 命令会话（每条命令通过原生 Node WinRM 客户端执行，输出实时返回） |
 | 服务管理 | 列出 / 启动 / 停止 / 重启 / 改启动类型（自动/手动/禁用） |
 | 进程管理 | 列出（CPU/内存/路径）/ 按 PID 结束 |
+| 远程文本文件 | 读（按行分页、编码感知、行号信封）/ 写（整文件覆盖，可选 UTF-8 / UTF-8 BOM / UTF-16LE）/ 编辑（精确串替换，保持原编码，非唯一匹配默认拒绝） |
 | 文件传输 | WinRM 流式传输（上传单 shell 单流 / 下载并行区间，**不依赖 SMB**，任意路径可传）；上传自动建目录 |
 | 集群 | 一条命令并发跑多台主机（按 aliases / environment / tags 过滤） |
 
@@ -80,6 +81,9 @@ winrm_exec  alias=web1 command="Get-Service | Select -First 5 | Format-Table"
 winrm_service alias=web1 name=W3SVC action=restart
 winrm_process alias=web1 action=list
 winrm_process alias=web1 id=1234 action=kill
+winrm_read   alias=web1 remotePath=C:\logs\app.log offset=1 limit=200
+winrm_write  alias=web1 remotePath=C:\temp\run.ps1 content="$env:TEMP" encoding=utf8bom
+winrm_edit   alias=web1 remotePath=C:\temp\app.config oldString="port=8080" newString="port=9090"
 winrm_upload alias=web1 localPath=D:\a.zip remotePath=C:\temp\a.zip
 winrm_download alias=web1 remotePath=C:\logs\app.log localPath=D:\app.log
 winrm_cluster command="Get-Date" tags=prod
@@ -90,7 +94,7 @@ winrm_cluster command="Get-Date" tags=prod
 ```
 src/
   index.ts            Cordis 插件入口（webServer/tools/systemPrompt 挂载 + 设置面板 + 公告）
-  engine.ts           WinRmEngine 门面：exec / services / processes / ls / upload / download / console / cluster / test
+  engine.ts           WinRmEngine 门面：exec / services / processes / readFile / writeFile / editFile / ls / upload / download / console / cluster / test
   store.ts            ~/.dsh/dsh-winrm.json 主机存储（原子写，0600）
   protocol.ts         宿主↔浏览器 wire 类型
   powershell.ts       PS 片段构造器 + stdin 信封（outer/child 包装 / 服务 / 进程 / 目录 / 流式收发脚本）

@@ -343,6 +343,184 @@ export function psWriteChunk(p: string, b64: string, append: boolean): string {
   ].join('\r\n')
 }
 
+/**
+ * JSON: one bounded, line-numbered window of a remote TEXT file.
+ *
+ * Decodes UTF-8 (with or without BOM), UTF-16LE and UTF-16BE by BOM, and
+ * rejects invalid UTF-8 instead of returning mojibake — a binary file fails
+ * loudly rather than as unreadable text. Lines are numbered from 1 over the
+ * whole file, `offset` selects the first returned line, and the window stops
+ * early once the joined text would exceed `maxBytes` (reported as
+ * `truncated`, so the caller knows more lines remain). A line longer than
+ * `maxLineLength` is cut to `maxLineLength + 1` code units here; the Node half
+ * appends the truncation note.
+ *
+ * A missing path or a directory emits `{"exists":false}`; anything the reader
+ * rejects emits `{"error":…}`. Both keep the exit code at 0 so the caller
+ * always receives parseable JSON rather than a PowerShell error record.
+ * @param p - remote path.
+ * @param offset - 1-based first line to return.
+ * @param limit - maximum number of lines to return.
+ * @param maxLineLength - maximum characters kept per line.
+ * @param maxBytes - maximum UTF-8 bytes of joined line text.
+ * @returns the PowerShell fragment.
+ */
+export function psReadTextWindow(
+  p: string,
+  offset: number,
+  limit: number,
+  maxLineLength: number,
+  maxBytes: number,
+): string {
+  return [
+    '$__p = ' + sq(p),
+    '$__err = $null',
+    '$__json = $null',
+    'try {',
+    '  $__i = Get-Item -LiteralPath $__p -ErrorAction SilentlyContinue',
+    '  if ($null -eq $__i -or $__i.PSIsContainer) {',
+    '    $__json = [pscustomobject]@{ exists = $false } | ConvertTo-Json -Compress',
+    '  } else {',
+    '    $__fs = [System.IO.File]::OpenRead($__p)',
+    '    try {',
+    '      $__b0 = New-Object byte[] 3',
+    '      $__n0 = $__fs.Read($__b0, 0, 3)',
+    '      $__fs.Position = 0',
+    "      $__enc = 'utf8'",
+    '      $__coding = New-Object System.Text.UTF8Encoding($false, $true)',
+    '      if ($__n0 -ge 2 -and $__b0[0] -eq 255 -and $__b0[1] -eq 254) {',
+    "        $__enc = 'utf16le'",
+    '        $__coding = [System.Text.Encoding]::Unicode',
+    '      } elseif ($__n0 -ge 2 -and $__b0[0] -eq 254 -and $__b0[1] -eq 255) {',
+    "        $__enc = 'utf16be'",
+    '        $__coding = [System.Text.Encoding]::BigEndianUnicode',
+    '      } elseif ($__n0 -ge 3 -and $__b0[0] -eq 239 -and $__b0[1] -eq 187 -and $__b0[2] -eq 191) {',
+    "        $__enc = 'utf8bom'",
+    '      }',
+    '      $__r = New-Object System.IO.StreamReader($__fs, $__coding, $true)',
+    '      try {',
+    '        $__total = 0',
+    '        $__sel = New-Object System.Collections.ArrayList',
+    '        $__used = 0',
+    '        $__cut = $false',
+    '        while ($null -ne ($__line = $__r.ReadLine())) {',
+    '          $__total++',
+    '          if ($__cut) { continue }',
+    '          if ($__total -lt ' + String(offset) + ') { continue }',
+    '          if ($__sel.Count -ge ' + String(limit) + ') { $__cut = $true; continue }',
+    '          $__t = $__line',
+    '          if ($__t.Length -gt ' + String(maxLineLength + 1) + ') { $__t = $__t.Substring(0, ' + String(maxLineLength + 1) + ') }',
+    '          $__b = [System.Text.Encoding]::UTF8.GetByteCount($__t)',
+    '          if ($__sel.Count -gt 0) { $__b++ }',
+    '          if ($__used + $__b -gt ' + String(maxBytes) + ') { $__cut = $true; continue }',
+    '          $__used += $__b',
+    '          [void]$__sel.Add($__t)',
+    '        }',
+    '      } finally { $__r.Dispose() }',
+    '    } finally { $__fs.Dispose() }',
+    '    $__json = [pscustomobject]@{',
+    '      exists = $true',
+    '      size = [long]$__i.Length',
+    '      encoding = $__enc',
+    '      totalLines = $__total',
+    '      lineCount = $__sel.Count',
+    '      truncated = $__cut',
+    '      linesText = (($__sel | ForEach-Object { [string]$_ }) -join "`n")',
+    '    } | ConvertTo-Json -Compress -Depth 3',
+    '  }',
+    '} catch { $__err = $_.Exception.GetBaseException().Message }',
+    'if ($null -ne $__err) { [pscustomobject]@{ error = $__err } | ConvertTo-Json -Compress }',
+    'else { $__json }',
+    '',
+  ].join('\r\n')
+}
+
+/**
+ * JSON: replace `oldB64` with `newB64` (both UTF-8, base64-carried) in a remote
+ * text file, preserving its encoding and writing through the same file.
+ *
+ * The search is ordinal and never pattern-based, so a replacement cannot be
+ * reinterpreted as a regular expression. Without `replaceAll` the edit is
+ * refused unless the needle appears exactly once, which is what keeps a stale
+ * or too-short needle from rewriting the wrong region. The file is read whole,
+ * so this is meant for source files and configuration, not for multi-hundred-
+ * megabyte logs.
+ *
+ * Failures (missing file, absent needle, ambiguous needle, undecodable bytes)
+ * are reported as `{"error":…}` with exit code 0 so the caller always receives
+ * parseable JSON.
+ * @param p - remote path.
+ * @param oldB64 - base64 of the UTF-8 text to find.
+ * @param newB64 - base64 of the UTF-8 text to substitute.
+ * @param replaceAll - replace every occurrence instead of requiring exactly one.
+ * @returns the PowerShell fragment.
+ */
+export function psEditText(p: string, oldB64: string, newB64: string, replaceAll: boolean): string {
+  // Only the selected mode is emitted. The two bodies fail differently, and
+  // shipping the unused one would leave a message in the script that can never
+  // fire — which reads like a live rule to anyone auditing the wire.
+  const branch = replaceAll
+    ? [
+        '  $__count = [int](($__text.Length - $__text.Replace($__old, [string]::Empty).Length) / $__old.Length)',
+        "  if ($__count -eq 0) { throw ('oldString was not found in ' + $__p) }",
+        '  $__out = $__text.Replace($__old, $__new)',
+      ]
+    : [
+        '  $__at = $__text.IndexOf($__old, [System.StringComparison]::Ordinal)',
+        "  if ($__at -lt 0) { throw ('oldString was not found in ' + $__p) }",
+        '  if ($__text.IndexOf($__old, $__at + 1, [System.StringComparison]::Ordinal) -ge 0) {',
+        "    throw ('oldString appears more than once in ' + $__p + '; pass replaceAll=true or include more surrounding context')",
+        '  }',
+        '  $__out = $__text.Substring(0, $__at) + $__new + $__text.Substring($__at + $__old.Length)',
+        '  $__count = 1',
+      ]
+  return [
+    '$__p = ' + sq(p),
+    '$__err = $null',
+    '$__json = $null',
+    'try {',
+    '  $__i = Get-Item -LiteralPath $__p -ErrorAction SilentlyContinue',
+    "  if ($null -eq $__i -or $__i.PSIsContainer) { throw ('remote file not found: ' + $__p) }",
+    '  $__old = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String(' + sq(oldB64) + '))',
+    '  $__new = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String(' + sq(newB64) + '))',
+    '  if ($__old.Length -eq 0) { throw ' + sq('oldString must be a non-empty string') + ' }',
+    '  $__fs = [System.IO.File]::OpenRead($__p)',
+    '  try {',
+    '    $__b0 = New-Object byte[] 3',
+    '    $__n0 = $__fs.Read($__b0, 0, 3)',
+    '    $__fs.Position = 0',
+    "    $__enc = 'utf8'",
+    '    $__coding = New-Object System.Text.UTF8Encoding($false, $true)',
+    '    if ($__n0 -ge 2 -and $__b0[0] -eq 255 -and $__b0[1] -eq 254) {',
+    "      $__enc = 'utf16le'",
+    '      $__coding = [System.Text.Encoding]::Unicode',
+    '    } elseif ($__n0 -ge 2 -and $__b0[0] -eq 254 -and $__b0[1] -eq 255) {',
+    "      $__enc = 'utf16be'",
+    '      $__coding = [System.Text.Encoding]::BigEndianUnicode',
+    '    } elseif ($__n0 -ge 3 -and $__b0[0] -eq 239 -and $__b0[1] -eq 187 -and $__b0[2] -eq 191) {',
+    "      $__enc = 'utf8bom'",
+    '    }',
+    '    $__r = New-Object System.IO.StreamReader($__fs, $__coding, $true)',
+    '    try { $__text = $__r.ReadToEnd() } finally { $__r.Dispose() }',
+    '  } finally { $__fs.Dispose() }',
+    ...branch,
+    '  if ($__enc -eq "utf8bom") { [System.IO.File]::WriteAllText($__p, $__out, (New-Object System.Text.UTF8Encoding($true))) }',
+    '  elseif ($__enc -eq "utf16le") { [System.IO.File]::WriteAllText($__p, $__out, [System.Text.Encoding]::Unicode) }',
+    '  elseif ($__enc -eq "utf16be") { [System.IO.File]::WriteAllText($__p, $__out, [System.Text.Encoding]::BigEndianUnicode) }',
+    '  else { [System.IO.File]::WriteAllText($__p, $__out, (New-Object System.Text.UTF8Encoding($false))) }',
+    '  $__json = [pscustomobject]@{',
+    '    path = $__p',
+    '    encoding = $__enc',
+    '    replacements = $__count',
+    '    size = [long](Get-Item -LiteralPath $__p).Length',
+    '  } | ConvertTo-Json -Compress -Depth 3',
+    '} catch { $__err = $_.Exception.GetBaseException().Message }',
+    'if ($null -ne $__err) { [pscustomobject]@{ error = $__err } | ConvertTo-Json -Compress }',
+    'else { $__json }',
+    '',
+  ].join('\r\n')
+}
+
 /** Magic stamped into the frame header that precedes every stream chunk. */
 export const STREAM_FRAME_MAGIC = 'DSHZ'
 

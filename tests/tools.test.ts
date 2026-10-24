@@ -14,11 +14,14 @@ import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
 import {
   winrmClusterTool,
   winrmDownloadTool,
+  winrmEditTool,
   winrmExecTool,
   winrmListTool,
   winrmProcessTool,
+  winrmReadTool,
   winrmServiceTool,
   winrmUploadTool,
+  winrmWriteTool,
 } from '../src/tools.ts'
 
 /**
@@ -169,4 +172,117 @@ test('winrm_cluster output schema accepts full and sparse results', async () => 
     ],
   }))
   assertValidOutput(tool, await tool.execute({ command: 'hostname' }))
+})
+
+test('winrm_read output schema accepts a window, an empty file, and errors', async () => {
+  const window = winrmReadTool(stubEngine({
+    readFile: async () => ({
+      path: 'C:\\temp\\app.log',
+      offset: 1,
+      lines: [{ number: 1, text: 'first' }, { number: 2, text: '' }],
+      totalLines: 2,
+      encoding: 'utf8bom',
+      truncatedByBytes: false,
+    }),
+  }))
+  const value = await window.execute({ alias: 'a', remotePath: 'C:\\temp\\app.log' })
+  assertValidOutput(window, value)
+  // The rendered text must stay in the numbered envelope the local read tool
+  // uses, or a model reading both tools gets two different shapes.
+  const rendered = window.output.render?.({}, value) ?? []
+  const body = rendered.map(block => (block.type === 'text' ? block.text : '')).join('')
+  assert.match(body, /<path>C:\\temp\\app\.log<\/path>/)
+  assert.match(body, /<type>file<\/type>/)
+  assert.match(body, /1: first/)
+  assert.match(body, /2: $/m)
+  assert.match(body, /\(End of file - total 2 lines\)/)
+
+  const empty = winrmReadTool(stubEngine({
+    readFile: async () => ({ path: 'C:\\e.txt', offset: 1, lines: [], totalLines: 0, encoding: 'utf8', truncatedByBytes: false }),
+  }))
+  const emptyValue = await empty.execute({ alias: 'a', remotePath: 'C:\\e.txt' })
+  assertValidOutput(empty, emptyValue)
+  const emptyBody = (empty.output.render?.({}, emptyValue) ?? []).map(block => (block.type === 'text' ? block.text : '')).join('')
+  assert.match(emptyBody, /\(End of file - total 0 lines\)/)
+
+  // A byte-budget stop is not the end of the file; the footer must say so or
+  // the model stops paging early.
+  const cut = winrmReadTool(stubEngine({
+    readFile: async () => ({ path: 'C:\\big.log', offset: 1, lines: [{ number: 1, text: 'x' }], totalLines: 9_000, encoding: 'utf8', truncatedByBytes: true }),
+  }))
+  const cutValue = await cut.execute({ alias: 'a', remotePath: 'C:\\big.log' })
+  assertValidOutput(cut, cutValue)
+  const cutBody = (cut.output.render?.({}, cutValue) ?? []).map(block => (block.type === 'text' ? block.text : '')).join('')
+  assert.match(cutBody, /byte budget — continue with offset=2/)
+
+  const failed = winrmReadTool(stubEngine({
+    readFile: async () => { throw new Error('remote file not found: C:\\nope.txt') },
+  }))
+  assertValidOutput(failed, await failed.execute({ alias: 'a', remotePath: 'C:\\nope.txt' }))
+})
+
+test('winrm_read clamps offset and limit before calling the engine', async () => {
+  const seen: Array<{ offset: number; limit: number }> = []
+  const tool = winrmReadTool(stubEngine({
+    readFile: async (_alias: string, _path: string, offset: number, limit: number) => {
+      seen.push({ offset, limit })
+      return { path: 'p', offset, lines: [], totalLines: 0, encoding: 'utf8', truncatedByBytes: false }
+    },
+  }))
+  // A negative or zero offset would make the remote `-lt` test skip nothing and
+  // return the whole file; a huge limit would exceed the transport budget.
+  await tool.execute({ alias: 'a', remotePath: 'p', offset: 0, limit: 10_000_000 })
+  await tool.execute({ alias: 'a', remotePath: 'p', offset: -5, limit: 0 })
+  await tool.execute({ alias: 'a', remotePath: 'p' })
+  assert.deepEqual(seen[0], { offset: 1, limit: 5_000 })
+  assert.deepEqual(seen[1], { offset: 1, limit: 1 })
+  assert.deepEqual(seen[2], { offset: 1, limit: 2_000 })
+})
+
+test('winrm_write output schema accepts create, update, and errors', async () => {
+  for (const encoding of ['utf8', 'utf8bom', 'utf16le'] as const) {
+    const tool = winrmWriteTool(stubEngine({
+      writeFile: async () => ({ path: 'C:\\t\\a.ps1', operation: 'create', bytes: 44, encoding }),
+    }))
+    const value = await tool.execute({ alias: 'a', remotePath: 'C:\\t\\a.ps1', content: 'x', encoding })
+    assertValidOutput(tool, value)
+    const body = (tool.output.render?.({}, value) ?? []).map(block => (block.type === 'text' ? block.text : '')).join('')
+    assert.match(body, /<content>\nCreated file \(44 bytes\)\n<\/content>/)
+  }
+
+  const updated = winrmWriteTool(stubEngine({
+    writeFile: async () => ({ path: 'C:\\t\\a.ps1', operation: 'update', bytes: 7, encoding: 'utf8' }),
+  }))
+  const updatedValue = await updated.execute({ alias: 'a', remotePath: 'C:\\t\\a.ps1', content: 'x' })
+  assertValidOutput(updated, updatedValue)
+  const updatedBody = (updated.output.render?.({}, updatedValue) ?? []).map(block => (block.type === 'text' ? block.text : '')).join('')
+  assert.match(updatedBody, /Updated file \(7 bytes\)/)
+
+  const failed = winrmWriteTool(stubEngine({
+    writeFile: async () => { throw new Error('SMB is not reachable on h:445') },
+  }))
+  assertValidOutput(failed, await failed.execute({ alias: 'a', remotePath: 'r', content: 'x' }))
+})
+
+test('winrm_edit output schema accepts single, multiple, and error values', async () => {
+  const single = winrmEditTool(stubEngine({
+    editFile: async () => ({ path: 'C:\\t\\a.config', encoding: 'utf8', replacements: 1, size: 120 }),
+  }))
+  const singleValue = await single.execute({ alias: 'a', remotePath: 'C:\\t\\a.config', oldString: 'x', newString: 'y' })
+  assertValidOutput(single, singleValue)
+  const singleBody = (single.output.render?.({}, singleValue) ?? []).map(block => (block.type === 'text' ? block.text : '')).join('')
+  assert.equal(singleBody, 'The file C:\\t\\a.config has been updated successfully.')
+
+  const many = winrmEditTool(stubEngine({
+    editFile: async () => ({ path: 'C:\\t\\a.config', encoding: 'utf16le', replacements: 3, size: 90 }),
+  }))
+  const manyValue = await many.execute({ alias: 'a', remotePath: 'C:\\t\\a.config', oldString: 'x', newString: 'y', replaceAll: true })
+  assertValidOutput(many, manyValue)
+  const manyBody = (many.output.render?.({}, manyValue) ?? []).map(block => (block.type === 'text' ? block.text : '')).join('')
+  assert.match(manyBody, /All 3 occurrences were successfully replaced/)
+
+  const failed = winrmEditTool(stubEngine({
+    editFile: async () => { throw new Error('oldString appears more than once') },
+  }))
+  assertValidOutput(failed, await failed.execute({ alias: 'a', remotePath: 'r', oldString: 'x', newString: 'y' }))
 })

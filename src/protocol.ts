@@ -96,6 +96,49 @@ export interface RemoteDirEntry {
   mtimeMs: number
 }
 
+/** One numbered line of a remote text file. */
+export interface RemoteTextLine {
+  /** 1-based line number within the remote file. */
+  number: number
+  /** Line text without its terminator; over-long lines are cut and annotated. */
+  text: string
+}
+
+/** Result of reading a bounded window of a remote text file. */
+export interface RemoteTextWindow {
+  path: string
+  /** 1-based line number of the first returned line. */
+  offset: number
+  lines: RemoteTextLine[]
+  /** Lines in the whole file, so the caller can page. */
+  totalLines: number
+  /** Detected encoding: `utf8`, `utf8bom`, `utf16le` or `utf16be`. */
+  encoding: string
+  /** True when the window stopped at the byte budget instead of at `limit`. */
+  truncatedByBytes: boolean
+}
+
+/** Text encodings the writer can emit. */
+export type RemoteTextEncoding = 'utf8' | 'utf8bom' | 'utf16le'
+
+/** Result of writing a remote text file. */
+export interface RemoteWriteOutcome {
+  path: string
+  /** `create` when the path was absent, `update` when it was overwritten. */
+  operation: 'create' | 'update'
+  bytes: number
+  encoding: RemoteTextEncoding
+}
+
+/** Result of an in-place remote text edit. */
+export interface RemoteEditOutcome {
+  path: string
+  /** Encoding the file already had, preserved across the edit. */
+  encoding: string
+  replacements: number
+  size: number
+}
+
 /** One server entry in a cluster run. */
 export interface ClusterResult {
   alias: string

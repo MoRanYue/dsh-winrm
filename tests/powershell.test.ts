@@ -14,6 +14,8 @@ import {
   powershellCommandLine,
   psFileSize,
   psReadChunk,
+  psReadTextWindow,
+  psEditText,
   psReceiveStream,
   psSendStream,
   psServiceAction,
@@ -217,4 +219,62 @@ test('the size probe distinguishes an absent path from an empty file', () => {
   assert.match(script, /Get-Item -LiteralPath 'C:\\a''b\.bin' -ErrorAction SilentlyContinue/)
   assert.match(script, /if \(\$null -ne \$__f -and -not \$__f\.PSIsContainer\) \{ \[string\]\$__f\.Length \}/)
   assert.doesNotMatch(script, /"\s*0\s*"/)
+})
+
+test('the text reader is bounded, encoding-aware, and quote-safe', () => {
+  const script = psReadTextWindow("C:\\it's\\app.log", 5, 100, 2_000, 524_288)
+  // Path goes through the single-quote escaper, or it would close the literal.
+  assert.match(script, /\$__p = 'C:\\it''s\\app\.log'/)
+  assert.match(script, /Get-Item -LiteralPath \$__p -ErrorAction SilentlyContinue/)
+  // Paging bounds are numeric literals, never quoted strings: `-lt '5'` would
+  // compare a number to a string and silently select the wrong window.
+  assert.match(script, /if \(\$__total -lt 5\) \{ continue \}/)
+  assert.match(script, /if \(\$__sel\.Count -ge 100\) \{ \$__cut = \$true; continue \}/)
+  assert.match(script, /\$__t\.Length -gt 2001\) \{ \$__t = \$__t\.Substring\(0, 2001\) \}/)
+  assert.match(script, /\$__used \+ \$__b -gt 524288/)
+  // BOM detection drives both the reported encoding and the decoder.
+  assert.match(script, /\$__b0\[0\] -eq 255 -and \$__b0\[1\] -eq 254/)
+  assert.match(script, /\$__b0\[0\] -eq 254 -and \$__b0\[1\] -eq 255/)
+  assert.match(script, /\$__b0\[0\] -eq 239 -and \$__b0\[1\] -eq 187 -and \$__b0\[2\] -eq 191/)
+  // Invalid UTF-8 must throw rather than decode to U+FFFD: a binary file has to
+  // fail loudly instead of arriving as plausible-looking text.
+  assert.match(script, /New-Object System\.Text\.UTF8Encoding\(\$false, \$true\)/)
+  // Both outcomes are JSON so the Node half never has to parse an error record.
+  assert.match(script, /exists = \$false/)
+  assert.match(script, /exists = \$true/)
+  assert.match(script, /\[pscustomobject\]@\{ error = \$__err \} \| ConvertTo-Json -Compress/)
+  // The caller's path must appear only in the escaped literal.
+  assert.equal(script.split("C:\\it''s\\app.log").length - 1, 1)
+})
+
+test('the text editor searches ordinally and refuses an ambiguous needle', () => {
+  const oldB64 = Buffer.from('a.b', 'utf8').toString('base64')
+  const newB64 = Buffer.from('a.c', 'utf8').toString('base64')
+
+  const once = psEditText("C:\\it's\\app.config", oldB64, newB64, false)
+  // Both payloads ride base64 through the single-quote escaper, so a needle
+  // containing quotes, newlines or `$` cannot become PowerShell code.
+  assert.match(once, new RegExp(`FromBase64String\\('${oldB64}'\\)`))
+  assert.match(once, new RegExp(`FromBase64String\\('${newB64}'\\)`))
+  assert.match(once, /Get-Item -LiteralPath \$__p -ErrorAction SilentlyContinue/)
+  // Ordinal, not regex: `.` in a needle must stay a literal dot.
+  assert.match(once, /IndexOf\(\$__old, \[System\.StringComparison\]::Ordinal\)/)
+  assert.doesNotMatch(once, /-replace|-match|-cmatch/)
+  // A second hit is an error, which is what stops a stale needle from
+  // rewriting the wrong region.
+  assert.match(once, /oldString appears more than once in /)
+  // The bulk body must not ship at all: a message that can never fire reads
+  // like a live rule to anyone auditing the wire.
+  assert.doesNotMatch(once, /Replace\(\$__old, \$__new\)/)
+
+  const all = psEditText('C:\\a.txt', oldB64, newB64, true)
+  assert.match(all, /Replace\(\$__old, \$__new\)/)
+  assert.doesNotMatch(all, /oldString appears more than once/)
+  assert.doesNotMatch(all, /StringComparison\]::Ordinal/)
+  // Every branch rewrites through the encoding the file already had, so a
+  // UTF-16 file does not silently become UTF-8 after one edit.
+  assert.match(all, /New-Object System\.Text\.UTF8Encoding\(\$true\)/)
+  assert.match(all, /\[System\.Text\.Encoding\]::Unicode\)/)
+  assert.match(all, /\[System\.Text\.Encoding\]::BigEndianUnicode\)/)
+  assert.match(all, /New-Object System\.Text\.UTF8Encoding\(\$false\)/)
 })
