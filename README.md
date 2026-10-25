@@ -1,6 +1,6 @@
 # dsh-winrm — Windows 远程管理插件（WinRM / PowerShell Remoting）
 
-[中文文档](README.zh.md) | English
+中文 | [English](README.en.md)
 
 仿照 [dsh-ssh](https://github.com/zhu1090093659/dsh-web-ui/tree/main/packages/dsh-ssh) 开发的 DSH 插件：用 Windows 原生的 **WinRM / PowerShell Remoting** 协议远程管理 Windows 服务器，**目标机不需要装 OpenSSH**。
 
@@ -42,6 +42,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\enable-winrm.ps1
 
 > ⚠️ **安全**：HTTP + Basic 是明文，仅限受信内网；公网请配置 HTTPS + 自签名证书，并在插件里勾选「接受自签名证书」。密码明文存于本机 `~/.dsh/dsh-winrm.json`（0600 权限，仅当前用户可读），插件界面永不回显。
 
+## 截图
+
+![dsh-winrm：侧边栏「Windows」入口打开后的主机页签](docs/screenshots/winrm-panel.png)
+
 ## 安装
 
 > 需要 DeepSeek Harness **0.1.7-alpha.2 及以后**（含 `0.1.7-rc.1`、`0.2.0-rc.*`、`0.2.x`）。插件的 `peerDependencies` 声明为 `^0.1.7-alpha.2 || ^0.2.0-rc.1`，DSH 启动时会据此校验：0.1.7 与 0.2.x 各版本可加载，`0.3.0` 起会被拒绝（确需冒险可用 `dsh plugin allow-version` 逐版本放行）。
@@ -49,7 +53,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\enable-winrm.ps1
 从 [Releases](https://github.com/MoRanYue/dsh-winrm/releases) 下载最新的 `dsh-winrm-*.tgz`，加入 profile：
 
 ```powershell
-dsh plugin --profile web add D:\downloads\dsh-winrm-0.3.0.tgz
+dsh plugin --profile web add D:\downloads\dsh-winrm-0.3.1.tgz
 ```
 
 也可以直接从 npm 安装：
@@ -98,13 +102,15 @@ src/
   engine.ts           WinRmEngine 门面：exec / services / processes / readFile / writeFile / editFile / ls / upload / download / console / cluster / test
   store.ts            ~/.dsh/dsh-winrm.json 主机存储（原子写，0600）
   protocol.ts         宿主↔浏览器 wire 类型
+  diff.ts             转录卡片用的有界 hunk 推导（不依赖 diff 包）
   powershell.ts       PS 片段构造器 + stdin 信封（outer/child 包装 / 服务 / 进程 / 目录 / 流式收发脚本）
   routes.ts           /api/dsh-winrm 路由族 + 控制台 WebSocket（loopback 围栏）
-  tools.ts            7 个 winrm_* agent 工具
+  tools.ts            10 个 winrm_* agent 工具
   engine/client.ts    winrm-client 传输层：进程内认证（NTLM/Basic）、UTF-8 信封、流式上传/下载 + 分块回退
   engine/wsman.ts     手写 WSMan Send/Receive 信封（原始字节走 stdin，不做二次 base64；512000 信封上限）
   engine/console.ts   流式 PowerShell 控制台会话
   client/             浏览器半：侧边栏入口 + 居中面板（5 页签）
+  client/tool/        转录卡片：tool.call.toolview 三个帧 + DSH 原生 ReadBlock / DiffBlock 渲染
 scripts/
   enable-winrm.ps1    目标机一键启用 WinRM
   postbuild.mjs       客户端产物 __ModuleLoader__ 包装

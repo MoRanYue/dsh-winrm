@@ -82,8 +82,9 @@
     "lib/**/*.d.ts",
     "src",
     "cordis.patch.yml",
+    "docs/screenshots/*.png",
     "README.md",
-    "README.zh.md",
+    "README.en.md",
     "RELEASING.md",
     "scripts"
   ],
