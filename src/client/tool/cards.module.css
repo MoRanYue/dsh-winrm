@@ -1,11 +1,89 @@
 /*
- * Only the one-line rows this plugin draws itself. The card bodies are the
+ * Only the pieces this plugin draws itself: the failed-call row, the collapsed
+ * header line, and the summary note under a card. The card bodies are the
  * harness's own `ReadBlock` / `DiffBlock` primitives, which carry their own
- * styles; these rows use the same `--dsw-alias-*` tokens so they sit in the
- * same visual language.
+ * styles.
+ *
+ * The header line copies the measurements of the harness's own tool rows
+ * (`ui-tool`'s `ToolRow.module.css`) rather than approximating them, so a
+ * remote file row sits in the transcript exactly like a local one:
+ * `[16 leading] gap6 [title] gap8 [2px dot] gap8 [path fill] [trailing figure]`.
  */
 
-.row,
+/* Hover scope for the trailing +/- totals: the harness tints them only while
+   the row is hovered or expanded, keeping a quiet transcript quiet. */
+.wrap {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.wrap:hover .added,
+.wrap:focus-within .added {
+  color: var(--dsw-alias-state-success-primary);
+}
+
+.wrap:hover .removed,
+.wrap:focus-within .removed {
+  color: var(--dsw-alias-state-error-primary);
+}
+
+/* The separator between the verb and the path: a 2px dot, not a character, so
+   it never picks up the text font's metrics. */
+.sep {
+  flex: none;
+  width: 2px;
+  height: 2px;
+  border-radius: 1px;
+  margin: 0 8px;
+  background: var(--dsw-alias-label-caption);
+}
+
+/* The remote path hugs its text and clips when the row is narrow, so the
+   trailing figure reads as part of the same sentence instead of being pushed to
+   the far edge of a wide row. Same treatment the harness gives a file path. */
+.summary {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--dsh-content-font-size-secondary, 13px);
+  line-height: calc(24px + var(--dsh-content-font-delta, 0px));
+  font-variant-numeric: tabular-nums;
+}
+
+/* Trailing figure kept outside the path's ellipsis: a line count or a status
+   word whose whole value is that it survives a narrow row. */
+.meta {
+  flex: none;
+  margin-left: 8px;
+  white-space: nowrap;
+  font-size: var(--dsh-content-font-size-secondary, 13px);
+  line-height: calc(24px + var(--dsh-content-font-delta, 0px));
+  font-variant-numeric: tabular-nums;
+}
+
+/* The `+n -m` figure a write or edit row shows beside its path: the code font,
+   matching the diff body it summarizes, two px under the secondary tier
+   because mono digits read optically larger than the sans path. */
+.diffStat {
+  flex: none;
+  margin-left: 10px;
+  white-space: nowrap;
+  font-family: var(--ds-font-family-code);
+  font-size: calc(var(--dsh-content-font-size-secondary, 13px) - 2px);
+  line-height: calc(24px + var(--dsh-content-font-delta, 0px));
+  transform: translateY(0.5px);
+  font-variant-numeric: tabular-nums;
+}
+
+.added,
+.removed {
+  color: inherit;
+}
+
+/* One-line row for a call that failed: the message replaces the card. */
 .rowError {
   display: flex;
   align-items: baseline;
@@ -39,8 +117,9 @@
   overflow-wrap: anywhere;
 }
 
+/* The note under an expanded card: encoding, truncation, replacement count. */
 .note {
-  padding: 2px 0 0;
+  padding: 4px 0 0;
   color: var(--dsw-alias-label-tertiary);
   font-family: var(--dsw-font-family);
   font-size: 12px;
