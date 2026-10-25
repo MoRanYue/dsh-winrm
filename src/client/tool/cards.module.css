@@ -1,0 +1,49 @@
+/*
+ * Only the one-line rows this plugin draws itself. The card bodies are the
+ * harness's own `ReadBlock` / `DiffBlock` primitives, which carry their own
+ * styles; these rows use the same `--dsw-alias-*` tokens so they sit in the
+ * same visual language.
+ */
+
+.row,
+.rowError {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 0;
+  font-family: var(--dsw-font-family);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.title {
+  flex: none;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.detail {
+  min-width: 0;
+  color: var(--dsw-alias-label-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rowError .title {
+  color: var(--dsw-alias-state-error-primary);
+}
+
+.rowError .detail {
+  color: var(--dsw-alias-state-error-primary);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.note {
+  padding: 2px 0 0;
+  color: var(--dsw-alias-label-tertiary);
+  font-family: var(--dsw-font-family);
+  font-size: 12px;
+  line-height: 1.55;
+  font-variant-numeric: tabular-nums;
+}

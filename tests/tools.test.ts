@@ -195,7 +195,7 @@ test('winrm_read output schema accepts a window, an empty file, and errors', asy
   assert.match(body, /<type>file<\/type>/)
   assert.match(body, /1: first/)
   assert.match(body, /2: $/m)
-  assert.match(body, /\(End of file - total 2 lines\)/)
+  assert.match(body, /\(End of file - total 2 lines, encoding utf8bom\)/)
 
   const empty = winrmReadTool(stubEngine({
     readFile: async () => ({ path: 'C:\\e.txt', offset: 1, lines: [], totalLines: 0, encoding: 'utf8', truncatedByBytes: false }),
@@ -203,6 +203,7 @@ test('winrm_read output schema accepts a window, an empty file, and errors', asy
   const emptyValue = await empty.execute({ alias: 'a', remotePath: 'C:\\e.txt' })
   assertValidOutput(empty, emptyValue)
   const emptyBody = (empty.output.render?.({}, emptyValue) ?? []).map(block => (block.type === 'text' ? block.text : '')).join('')
+  // Plain UTF-8 gets no encoding suffix, so this exact footer also pins that.
   assert.match(emptyBody, /\(End of file - total 0 lines\)/)
 
   // A byte-budget stop is not the end of the file; the footer must say so or
@@ -214,6 +215,27 @@ test('winrm_read output schema accepts a window, an empty file, and errors', asy
   assertValidOutput(cut, cutValue)
   const cutBody = (cut.output.render?.({}, cutValue) ?? []).map(block => (block.type === 'text' ? block.text : '')).join('')
   assert.match(cutBody, /byte budget — continue with offset=2/)
+
+  // Hitting the requested line count is not a byte-budget stop, and the footer
+  // must not claim one: the caller asked for this many lines.
+  const paged = winrmReadTool(stubEngine({
+    readFile: async () => ({ path: 'C:\\b.log', offset: 3, lines: [{ number: 3, text: 'a' }, { number: 4, text: 'b' }], totalLines: 6, encoding: 'utf8', truncatedByBytes: false }),
+  }))
+  const pagedValue = await paged.execute({ alias: 'a', remotePath: 'C:\\b.log', offset: 3, limit: 2 })
+  assertValidOutput(paged, pagedValue)
+  const pagedBody = (paged.output.render?.({}, pagedValue) ?? []).map(block => (block.type === 'text' ? block.text : '')).join('')
+  assert.match(pagedBody, /\(Showing lines 3-4 of 6\. Continue with offset=5\.\)/)
+  assert.doesNotMatch(pagedBody, /byte budget/)
+
+  // A non-UTF-8 file has to say so: the caller's next write would otherwise
+  // replace the encoding without any way to notice first.
+  const wide = winrmReadTool(stubEngine({
+    readFile: async () => ({ path: 'C:\\w.ps1', offset: 1, lines: [{ number: 1, text: 'x' }], totalLines: 1, encoding: 'utf16le', truncatedByBytes: false }),
+  }))
+  const wideValue = await wide.execute({ alias: 'a', remotePath: 'C:\\w.ps1' })
+  assertValidOutput(wide, wideValue)
+  const wideBody = (wide.output.render?.({}, wideValue) ?? []).map(block => (block.type === 'text' ? block.text : '')).join('')
+  assert.match(wideBody, /\(End of file - total 1 lines, encoding utf16le\)/)
 
   const failed = winrmReadTool(stubEngine({
     readFile: async () => { throw new Error('remote file not found: C:\\nope.txt') },

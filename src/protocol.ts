@@ -116,6 +116,8 @@ export interface RemoteTextWindow {
   encoding: string
   /** True when the window stopped at the byte budget instead of at `limit`. */
   truncatedByBytes: boolean
+  /** Lines whose text was cut at the per-line cap and annotated in `lines`. */
+  truncatedLines: number
 }
 
 /** Text encodings the writer can emit. */
@@ -128,6 +130,13 @@ export interface RemoteWriteOutcome {
   operation: 'create' | 'update'
   bytes: number
   encoding: RemoteTextEncoding
+  /**
+   * Previous file text, or `null` for a create and for a file too large to
+   * serve as a diff basis. Only the presentation layer reads it.
+   */
+  before: string | null
+  /** Text after the write, on the same basis as {@link RemoteWriteOutcome.before}. */
+  after: string
 }
 
 /** Result of an in-place remote text edit. */
@@ -137,6 +146,13 @@ export interface RemoteEditOutcome {
   encoding: string
   replacements: number
   size: number
+  /**
+   * File text before the edit, or `null` when the file was too large to serve
+   * as a diff basis. Only the presentation layer reads it.
+   */
+  before: string | null
+  /** Text after the edit, on the same basis as {@link RemoteEditOutcome.before}. */
+  after: string | null
 }
 
 /** One server entry in a cluster run. */

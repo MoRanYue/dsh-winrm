@@ -403,6 +403,7 @@ export function psReadTextWindow(
     '        $__sel = New-Object System.Collections.ArrayList',
     '        $__used = 0',
     '        $__cut = $false',
+    '        $__bytes = $false',
     '        while ($null -ne ($__line = $__r.ReadLine())) {',
     '          $__total++',
     '          if ($__cut) { continue }',
@@ -412,7 +413,7 @@ export function psReadTextWindow(
     '          if ($__t.Length -gt ' + String(maxLineLength + 1) + ') { $__t = $__t.Substring(0, ' + String(maxLineLength + 1) + ') }',
     '          $__b = [System.Text.Encoding]::UTF8.GetByteCount($__t)',
     '          if ($__sel.Count -gt 0) { $__b++ }',
-    '          if ($__used + $__b -gt ' + String(maxBytes) + ') { $__cut = $true; continue }',
+    '          if ($__used + $__b -gt ' + String(maxBytes) + ') { $__cut = $true; $__bytes = $true; continue }',
     '          $__used += $__b',
     '          [void]$__sel.Add($__t)',
     '        }',
@@ -425,6 +426,7 @@ export function psReadTextWindow(
     '      totalLines = $__total',
     '      lineCount = $__sel.Count',
     '      truncated = $__cut',
+    '      truncatedByBytes = $__bytes',
     '      linesText = (($__sel | ForEach-Object { [string]$_ }) -join "`n")',
     '    } | ConvertTo-Json -Compress -Depth 3',
     '  }',
@@ -453,9 +455,11 @@ export function psReadTextWindow(
  * @param oldB64 - base64 of the UTF-8 text to find.
  * @param newB64 - base64 of the UTF-8 text to substitute.
  * @param replaceAll - replace every occurrence instead of requiring exactly one.
+ * @param basisMaxBytes - include the before/after text when the original file is
+ *   at most this large; `0` omits the basis entirely.
  * @returns the PowerShell fragment.
  */
-export function psEditText(p: string, oldB64: string, newB64: string, replaceAll: boolean): string {
+export function psEditText(p: string, oldB64: string, newB64: string, replaceAll: boolean, basisMaxBytes = 0): string {
   // Only the selected mode is emitted. The two bodies fail differently, and
   // shipping the unused one would leave a message in the script that can never
   // fire — which reads like a live rule to anyone auditing the wire.
@@ -474,6 +478,9 @@ export function psEditText(p: string, oldB64: string, newB64: string, replaceAll
         '  $__out = $__text.Substring(0, $__at) + $__new + $__text.Substring($__at + $__old.Length)',
         '  $__count = 1',
       ]
+  // A zero cap means the caller does not want a diff basis; emit a literal
+  // `if ($false)` rather than a comparison that would still read a large file.
+  const basisGuard = basisMaxBytes > 0 ? `[long]$__i.Length -le ${basisMaxBytes}` : '$false'
   return [
     '$__p = ' + sq(p),
     '$__err = $null',
@@ -508,12 +515,80 @@ export function psEditText(p: string, oldB64: string, newB64: string, replaceAll
     '  elseif ($__enc -eq "utf16le") { [System.IO.File]::WriteAllText($__p, $__out, [System.Text.Encoding]::Unicode) }',
     '  elseif ($__enc -eq "utf16be") { [System.IO.File]::WriteAllText($__p, $__out, [System.Text.Encoding]::BigEndianUnicode) }',
     '  else { [System.IO.File]::WriteAllText($__p, $__out, (New-Object System.Text.UTF8Encoding($false))) }',
+    '  $__basis = $null',
+    '  if (' + basisGuard + ') {',
+    '    $__basis = [pscustomobject]@{',
+    '      before = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($__text))',
+    '      after = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($__out))',
+    '    }',
+    '  }',
     '  $__json = [pscustomobject]@{',
     '    path = $__p',
     '    encoding = $__enc',
     '    replacements = $__count',
     '    size = [long](Get-Item -LiteralPath $__p).Length',
+    '    basis = $__basis',
     '  } | ConvertTo-Json -Compress -Depth 3',
+    '} catch { $__err = $_.Exception.GetBaseException().Message }',
+    'if ($null -ne $__err) { [pscustomobject]@{ error = $__err } | ConvertTo-Json -Compress }',
+    'else { $__json }',
+    '',
+  ].join('\r\n')
+}
+
+/**
+ * JSON: the whole remote text file as base64, or a refusal when it is missing
+ * or larger than `maxBytes`.
+ *
+ * The write tool needs the previous text to project a diff card, and the line
+ * window reader cannot serve that: it numbers lines and caps each one, so a
+ * long line would silently truncate inside the diff basis. The BOM detection
+ * repeats {@link psEditText}'s on purpose — both must decode identically, and a
+ * shared emitter would hide that requirement behind a helper neither could be
+ * reviewed against.
+ *
+ * Failures are reported as `{"error":…}` with exit code 0, so the caller always
+ * receives parseable JSON.
+ * @param p - remote path.
+ * @param maxBytes - largest file whose text is returned.
+ * @returns the PowerShell fragment.
+ */
+export function psReadTextBasis(p: string, maxBytes: number): string {
+  return [
+    '$__p = ' + sq(p),
+    '$__err = $null',
+    '$__json = $null',
+    'try {',
+    '  $__i = Get-Item -LiteralPath $__p -ErrorAction SilentlyContinue',
+    "  if ($null -eq $__i -or $__i.PSIsContainer) { throw ('remote file not found: ' + $__p) }",
+    `  if ([long]$__i.Length -gt ${maxBytes}) {`,
+    '    $__json = [pscustomobject]@{ tooLarge = $true; encoding = $null; text = $null } | ConvertTo-Json -Compress',
+    '  } else {',
+    '    $__fs = [System.IO.File]::OpenRead($__p)',
+    '    try {',
+    '      $__b0 = New-Object byte[] 3',
+    '      $__n0 = $__fs.Read($__b0, 0, 3)',
+    '      $__fs.Position = 0',
+    "      $__enc = 'utf8'",
+    '      $__coding = New-Object System.Text.UTF8Encoding($false, $true)',
+    '      if ($__n0 -ge 2 -and $__b0[0] -eq 255 -and $__b0[1] -eq 254) {',
+    "        $__enc = 'utf16le'",
+    '        $__coding = [System.Text.Encoding]::Unicode',
+    '      } elseif ($__n0 -ge 2 -and $__b0[0] -eq 254 -and $__b0[1] -eq 255) {',
+    "        $__enc = 'utf16be'",
+    '        $__coding = [System.Text.Encoding]::BigEndianUnicode',
+    '      } elseif ($__n0 -ge 3 -and $__b0[0] -eq 239 -and $__b0[1] -eq 187 -and $__b0[2] -eq 191) {',
+    "        $__enc = 'utf8bom'",
+    '      }',
+    '      $__r = New-Object System.IO.StreamReader($__fs, $__coding, $true)',
+    '      try { $__text = $__r.ReadToEnd() } finally { $__r.Dispose() }',
+    '    } finally { $__fs.Dispose() }',
+    '    $__json = [pscustomobject]@{',
+    '      tooLarge = $false',
+    '      encoding = $__enc',
+    '      text = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($__text))',
+    '    } | ConvertTo-Json -Compress -Depth 3',
+    '  }',
     '} catch { $__err = $_.Exception.GetBaseException().Message }',
     'if ($null -ne $__err) { [pscustomobject]@{ error = $__err } | ConvertTo-Json -Compress }',
     'else { $__json }',

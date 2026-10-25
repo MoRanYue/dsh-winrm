@@ -231,7 +231,13 @@ test('the text reader is bounded, encoding-aware, and quote-safe', () => {
   assert.match(script, /if \(\$__total -lt 5\) \{ continue \}/)
   assert.match(script, /if \(\$__sel\.Count -ge 100\) \{ \$__cut = \$true; continue \}/)
   assert.match(script, /\$__t\.Length -gt 2001\) \{ \$__t = \$__t\.Substring\(0, 2001\) \}/)
-  assert.match(script, /\$__used \+ \$__b -gt 524288/)
+  assert.match(script, /\$__used \+ \$__b -gt 524288\) \{ \$__cut = \$true; \$__bytes = \$true; continue \}/)
+  // The line limit and the byte budget stop the window for different reasons,
+  // and the footer says which one: `truncated` covers both, `truncatedByBytes`
+  // only the budget.
+  assert.doesNotMatch(script, /if \(\$__sel\.Count -ge 100\) \{ \$__cut = \$true; \$__bytes = \$true/)
+  assert.match(script, /truncated = \$__cut/)
+  assert.match(script, /truncatedByBytes = \$__bytes/)
   // BOM detection drives both the reported encoding and the decoder.
   assert.match(script, /\$__b0\[0\] -eq 255 -and \$__b0\[1\] -eq 254/)
   assert.match(script, /\$__b0\[0\] -eq 254 -and \$__b0\[1\] -eq 255/)

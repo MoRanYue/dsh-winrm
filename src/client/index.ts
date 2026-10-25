@@ -23,6 +23,7 @@ import type { MainPanelId } from '@deepseek-ai/dsh-client-ui-layout/client'
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
 import { WinrmApi } from './api.ts'
 import { en, zh, type WinKey } from './locales.ts'
+import { WinrmEditCard, WinrmReadCard, WinrmWriteCard } from './tool/cards.tsx'
 import { WinrmPanel } from './panel/WinrmPanel.tsx'
 import { WinrmPanelIcon } from './panel/WinrmPanelIcon.tsx'
 
@@ -70,6 +71,22 @@ export function apply(ctx: ClientContext): void {
     locale: NS,
     inject: () => ({ api, onBack: () => { ctx.layout.selectPanel(null) } }),
   }, WinrmPanel))
+
+  // Transcript cards for the three remote file tools, keyed by wire tool name.
+  // Without an entry here each call renders as the generic tool row, so the
+  // user reads the same envelope text the model reads. The cards read the
+  // metadata the host persists with each result.
+  for (const [key, card] of [
+    ['winrm_read', WinrmReadCard],
+    ['winrm_write', WinrmWriteCard],
+    ['winrm_edit', WinrmEditCard],
+  ] as const) {
+    ctx.slots.inject('tool.call.toolview', () => ctx.slots.register({
+      name: 'tool.call.toolview',
+      key,
+      locale: NS,
+    }, card))
+  }
 
   // The sidebar row: an icon plus a localized label; selecting it opens the panel.
   ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({

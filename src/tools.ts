@@ -6,6 +6,7 @@
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
+import { boundedHunkDiffs, type RemoteFileDiff } from './diff.ts'
 import { READ_DEFAULT_LIMIT, READ_MAX_LIMIT, type WinRmEngine } from './engine.ts'
 import type { ClusterResult, ExecResult, WinHostSummary } from './protocol.ts'
 
@@ -393,6 +394,7 @@ function renderWindow(window: {
   offset?: number
   lines?: Array<{ number: number; text: string }>
   totalLines?: number
+  encoding?: string
   truncatedByBytes?: boolean
 }): string {
   const lines = window.lines ?? []
@@ -400,17 +402,22 @@ function renderWindow(window: {
   const total = window.totalLines ?? 0
   const last = offset + lines.length - 1
   const body = lines.map(line => `${line.number}: ${line.text}`).join('\n')
+  // Only a non-UTF-8 file needs saying: that is when a later write would
+  // otherwise replace the encoding without the caller noticing.
+  const encoding = window.encoding !== undefined && window.encoding !== 'utf8'
+    ? `, encoding ${window.encoding}`
+    : ''
   let footer: string
   if (lines.length === 0) {
     footer = total === 0
-      ? '(End of file - total 0 lines)'
-      : `(No lines at offset ${offset}; the file has ${total} lines.)`
+      ? `(End of file - total 0 lines${encoding})`
+      : `(No lines at offset ${offset}; the file has ${total} lines${encoding}.)`
   } else if (window.truncatedByBytes === true) {
-    footer = `(Showing lines ${offset}-${last} of ${total}. The window stopped at the byte budget — continue with offset=${last + 1}.)`
+    footer = `(Showing lines ${offset}-${last} of ${total}${encoding}. The window stopped at the byte budget — continue with offset=${last + 1}.)`
   } else if (last < total) {
-    footer = `(Showing lines ${offset}-${last} of ${total}. Continue with offset=${last + 1}.)`
+    footer = `(Showing lines ${offset}-${last} of ${total}${encoding}. Continue with offset=${last + 1}.)`
   } else {
-    footer = `(End of file - total ${total} lines)`
+    footer = `(End of file - total ${total} lines${encoding})`
   }
   const content = body === '' ? footer : `${body}\n\n${footer}`
   return [`<path>${window.path ?? ''}</path>`, '<type>file</type>', '<content>', content, '</content>'].join('\n')
@@ -450,12 +457,41 @@ export function winrmReadTool(engine: WinRmEngine) {
           totalLines: { type: 'integer' },
           encoding: { type: 'string' },
           truncatedByBytes: { type: 'boolean' },
+          truncatedLines: { type: 'integer' },
           error: { type: 'string' },
         },
       },
-      render: (_args, value: { ok: boolean; path?: string; offset?: number; lines?: Array<{ number: number; text: string }>; totalLines?: number; truncatedByBytes?: boolean; error?: string }) => text(value.ok
+      render: (_args, value: { ok: boolean; path?: string; offset?: number; lines?: Array<{ number: number; text: string }>; totalLines?: number; encoding?: string; truncatedByBytes?: boolean; error?: string }) => text(value.ok
         ? renderWindow(value)
         : `read failed: ${value.error ?? 'unknown error'}`),
+      // The GUI draws a read card from this; the model-facing text above stays
+      // the fallback for a client without the card.
+      presentationMeta: (args, value: { ok: boolean; path?: string; offset?: number; lines?: Array<{ number: number; text: string }>; totalLines?: number; encoding?: string; truncatedByBytes?: boolean; truncatedLines?: number; error?: string }) => (value.ok
+        ? {
+            card: 'winrm-read',
+            path: value.path ?? args.remotePath,
+            offset: value.offset ?? 1,
+            lines: value.lines ?? [],
+            totalLines: value.totalLines ?? 0,
+            encoding: value.encoding ?? 'utf8',
+            truncatedByBytes: value.truncatedByBytes === true,
+            truncatedLines: value.truncatedLines ?? 0,
+            // Every arm carries the same keys: the metadata is typed against a
+            // JSON index signature, where an arm-specific optional key would
+            // widen to `undefined` and stop satisfying it.
+            error: '',
+          }
+        : {
+            card: 'winrm-read',
+            path: args.remotePath,
+            offset: 0,
+            lines: [],
+            totalLines: 0,
+            encoding: '',
+            truncatedByBytes: false,
+            truncatedLines: 0,
+            error: value.error ?? 'unknown error',
+          }),
     },
     async execute(args) {
       const offset = Math.max(1, Math.trunc(args.offset ?? 1))
@@ -474,13 +510,13 @@ export function winrmReadTool(engine: WinRmEngine) {
 export function winrmWriteTool(engine: WinRmEngine) {
   return defineTool({
     name: 'winrm_write',
-    description: 'Write a text file ON A REMOTE Windows host, creating parent directories and overwriting any existing file. The path is on the Windows host, not this machine — use `write` for local files, and prefer winrm_edit when only part of an existing file changes. Line endings are sent verbatim, so include \\r\\n for a Windows-native file. ' +
+    description: 'Write a text file ON A REMOTE Windows host, creating parent directories and overwriting any existing file. The path is on the Windows host, not this machine — use `write` for local files, and prefer winrm_edit when only part of an existing file changes. Line endings are sent verbatim, so include \\r\\n for a Windows-native file. The encoding is whatever `encoding` asks for — rewriting an existing utf16le or utf8bom file without setting it converts the file to plain UTF-8; `winrm_read` names a non-UTF-8 file in its footer when you need to match one. ' +
       'Triggers: write file on Windows server, create remote script/config, overwrite remote file.',
     parameters: {
       alias: { type: 'string', required: true, description: 'Host alias from winrm_list.' },
       remotePath: { type: 'string', required: true, description: 'Destination path on the remote host, e.g. C:\\temp\\script.ps1 (parent dirs are created).' },
       content: { type: 'string', required: true, description: 'Full file content.' },
-      encoding: { type: 'string', enum: ['utf8', 'utf8bom', 'utf16le'], description: 'Byte-order mark to emit: utf8 (default, no BOM), utf8bom, or utf16le (PowerShell 5.1 reads a BOM-less script as ANSI, so non-ASCII script text needs a BOM).' },
+      encoding: { type: 'string', enum: ['utf8', 'utf8bom', 'utf16le'], description: 'Byte-order mark to emit: utf8 (default, no BOM), utf8bom, or utf16le (PowerShell 5.1 reads a BOM-less script as ANSI, so non-ASCII script text needs a BOM). Does not preserve the existing file\'s encoding — pass it explicitly when overwriting a UTF-16 or BOM-carrying file.' },
     },
     output: {
       schema: {
@@ -492,17 +528,67 @@ export function winrmWriteTool(engine: WinRmEngine) {
           operation: { type: 'string', enum: ['create', 'update'] },
           bytes: { type: 'integer' },
           encoding: { type: 'string', enum: ['utf8', 'utf8bom', 'utf16le'] },
+          diffs: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                path: { type: 'string', required: true },
+                oldText: { type: 'string', required: true },
+                newText: { type: 'string', required: true },
+              },
+            },
+          },
+          beyondBasis: { type: 'boolean' },
           error: { type: 'string' },
         },
       },
       render: (_args, value: { ok: boolean; path?: string; operation?: string; bytes?: number; error?: string }) => text(value.ok
         ? [`<path>${value.path ?? ''}</path>`, '<type>file</type>', '<content>', `${value.operation === 'update' ? 'Updated' : 'Created'} file (${value.bytes ?? 0} bytes)`, '</content>'].join('\n')
         : `write failed: ${value.error ?? 'unknown error'}`),
+      presentationMeta: (args, value: { ok: boolean; path?: string; operation?: 'create' | 'update'; bytes?: number; encoding?: string; diffs?: RemoteFileDiff[]; beyondBasis?: boolean; error?: string }) => (value.ok
+        ? {
+            card: 'winrm-write',
+            path: value.path ?? args.remotePath,
+            operation: value.operation ?? 'update',
+            bytes: value.bytes ?? 0,
+            encoding: value.encoding ?? 'utf8',
+            diffs: value.diffs ?? [],
+            beyondBasis: value.beyondBasis === true,
+            error: '',
+          }
+        : {
+            card: 'winrm-write',
+            path: args.remotePath,
+            operation: 'update' as const,
+            bytes: 0,
+            encoding: '',
+            diffs: [],
+            beyondBasis: false,
+            error: value.error ?? 'unknown error',
+          }),
     },
     async execute(args) {
       try {
         const outcome = await engine.writeFile(args.alias, args.remotePath, args.content, args.encoding ?? 'utf8')
-        return { ok: true, ...outcome }
+        // A create compares against nothing, so its whole content is one
+        // insertion hunk; an update whose prior text was past the basis cap
+        // reports the path without hunks rather than a misleading full rewrite.
+        const diffs = outcome.before !== null
+          ? boundedHunkDiffs(outcome.path, outcome.before, outcome.after)
+          : outcome.operation === 'create'
+            ? boundedHunkDiffs(outcome.path, '', outcome.after)
+            : []
+        return {
+          ok: true,
+          path: outcome.path,
+          operation: outcome.operation,
+          bytes: outcome.bytes,
+          encoding: outcome.encoding,
+          diffs,
+          beyondBasis: outcome.operation === 'update' && outcome.before === null,
+        }
       } catch (error) {
         return { ok: false, error: error instanceof Error ? error.message : String(error) }
       }
@@ -533,6 +619,19 @@ export function winrmEditTool(engine: WinRmEngine) {
           encoding: { type: 'string' },
           replacements: { type: 'integer' },
           size: { type: 'integer' },
+          diffs: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                path: { type: 'string', required: true },
+                oldText: { type: 'string', required: true },
+                newText: { type: 'string', required: true },
+              },
+            },
+          },
+          beyondBasis: { type: 'boolean' },
           error: { type: 'string' },
         },
       },
@@ -541,11 +640,45 @@ export function winrmEditTool(engine: WinRmEngine) {
           ? `The file ${value.path ?? ''} has been updated. All ${value.replacements ?? 0} occurrences were successfully replaced.`
           : `The file ${value.path ?? ''} has been updated successfully.`)
         : `edit failed: ${value.error ?? 'unknown error'}`),
+      presentationMeta: (args, value: { ok: boolean; path?: string; replacements?: number; size?: number; encoding?: string; diffs?: RemoteFileDiff[]; beyondBasis?: boolean; error?: string }) => (value.ok
+        ? {
+            card: 'winrm-edit',
+            path: value.path ?? args.remotePath,
+            replacements: value.replacements ?? 0,
+            size: value.size ?? 0,
+            encoding: value.encoding ?? 'utf8',
+            diffs: value.diffs ?? [],
+            beyondBasis: value.beyondBasis === true,
+            error: '',
+          }
+        : {
+            card: 'winrm-edit',
+            path: args.remotePath,
+            replacements: 0,
+            size: 0,
+            encoding: '',
+            diffs: [],
+            beyondBasis: false,
+            error: value.error ?? 'unknown error',
+          }),
     },
     async execute(args) {
       try {
         const outcome = await engine.editFile(args.alias, args.remotePath, args.oldString, args.newString, args.replaceAll ?? false)
-        return { ok: true, ...outcome }
+        // The edit fragment returns both texts only when the file was inside the
+        // basis cap; otherwise the card reports the path and the count alone.
+        const diffs = outcome.before !== null && outcome.after !== null
+          ? boundedHunkDiffs(outcome.path, outcome.before, outcome.after)
+          : []
+        return {
+          ok: true,
+          path: outcome.path,
+          encoding: outcome.encoding,
+          replacements: outcome.replacements,
+          size: outcome.size,
+          diffs,
+          beyondBasis: outcome.before === null,
+        }
       } catch (error) {
         return { ok: false, error: error instanceof Error ? error.message : String(error) }
       }
