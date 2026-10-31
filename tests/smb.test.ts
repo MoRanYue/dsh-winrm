@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { adminSharePath, smbUnavailable } from '../src/smb.ts'
+import { adminSharePath, smbPortOf, smbUnavailable } from '../src/smb.ts'
 
 test('admin share path conversion handles drives and backslashes', () => {
   assert.equal(adminSharePath('server1', 'D:\\AIpro\\site\\app.dll'), '\\\\server1\\D$\\AIpro\\site\\app.dll')
@@ -18,5 +18,14 @@ test('smbUnavailable names the host, the port, and the way out', () => {
   assert.match(error.message, /TCP 445/)
   // When channel "smb" is asked for on a host whose 445 is closed this message
   // is the only thing the caller sees, so it has to name the alternative.
+  assert.match(error.message, /channel "winrm"/)
+})
+
+test('a custom SMB port is reported with that port', () => {
+  assert.equal(smbPortOf({}), 445)
+  assert.equal(smbPortOf({ smbPort: 1445 }), 1445)
+  const error = smbUnavailable('server1', 1445)
+  assert.match(error.message, /server1:1445/)
+  assert.match(error.message, /smbPort/)
   assert.match(error.message, /channel "winrm"/)
 })

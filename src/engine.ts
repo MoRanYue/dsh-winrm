@@ -9,7 +9,7 @@
 import type { ClusterResult, ExecResult, ProcessInfo, RemoteDirEntry, RemoteEditOutcome, RemoteTextEncoding, RemoteTextWindow, RemoteWriteOutcome, ServiceInfo, TestResult, TransferProgress, WinHostSummary } from './protocol.ts'
 import type { HostStore } from './store.ts'
 import { connOf, downloadChunks, downloadStream, remoteFileSize, runScript, testConnection, uploadBuffer, uploadStream } from './engine/client.ts'
-import { downloadSmb, smbReachable, smbUnavailable, uploadSmb, type TransferChannel } from './smb.ts'
+import { downloadSmb, smbPortOf, smbReachable, smbUnavailable, uploadSmb, type TransferChannel } from './smb.ts'
 import { ConsoleSession } from './engine/console.ts'
 import { DIFF_BASIS_MAX_BYTES } from './diff.ts'
 import { psEditText, psKillProcess, psListDir, psListProcesses, psListServices, psReadTextBasis, psReadTextWindow, psServiceAction } from './powershell.ts'
@@ -454,9 +454,10 @@ export class WinRmEngine {
     return this.gate.run(alias, async () => {
       onProgress?.({ phase: 'connecting', file: remotePath, transferred: 0, total: data.length, percent: 0 })
       if (channel !== 'winrm') {
-        // Probe 445 first: `net use` takes ~60 s to fail against a host whose
-        // SMB is down, and on `auto` that delay landed before every upload.
-        if (await smbReachable(entry.host)) {
+        // Probe the SMB port first: `net use` takes ~60 s to fail against a
+        // host whose SMB is down, and on `auto` that delay landed before every
+        // upload.
+        if (await smbReachable(entry.host, smbPortOf(entry))) {
           try {
             const outcome = await uploadSmb(entry, localPath, remotePath)
             onProgress?.({ phase: 'done', file: remotePath, transferred: outcome.bytes, total: outcome.bytes, percent: 100 })
@@ -466,7 +467,7 @@ export class WinRmEngine {
             onProgress?.({ phase: 'connecting', file: remotePath, transferred: 0, total: data.length, percent: 0 })
           }
         } else if (channel === 'smb') {
-          throw smbUnavailable(entry.host)
+          throw smbUnavailable(entry.host, smbPortOf(entry))
         }
       }
       // WinRM transport: the streaming path moves the file over a single
@@ -491,8 +492,8 @@ export class WinRmEngine {
     return this.gate.run(alias, async () => {
       onProgress?.({ phase: 'connecting', file: remotePath, transferred: 0, total: 0, percent: 0 })
       if (channel !== 'winrm') {
-        // Same 445 probe as upload: `net use` has no short timeout of its own.
-        if (await smbReachable(entry.host)) {
+        // Same SMB probe as upload: `net use` has no short timeout of its own.
+        if (await smbReachable(entry.host, smbPortOf(entry))) {
           try {
             const outcome = await downloadSmb(entry, remotePath, localPath)
             onProgress?.({ phase: 'done', file: remotePath, transferred: outcome.bytes, total: outcome.bytes, percent: 100 })
@@ -502,7 +503,7 @@ export class WinRmEngine {
             onProgress?.({ phase: 'connecting', file: remotePath, transferred: 0, total: 0, percent: 0 })
           }
         } else if (channel === 'smb') {
-          throw smbUnavailable(entry.host)
+          throw smbUnavailable(entry.host, smbPortOf(entry))
         }
       }
       const { open, rm } = await import('node:fs/promises')

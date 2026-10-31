@@ -84,7 +84,10 @@ export function HostsTab({ api, onConnect }: HostsTabProps) {
         <td className={css.mono}>{host.alias}</td>
         <td className={css.mono}>{host.host}:{host.port}</td>
         <td>{host.user}</td>
-        <td><span className={css.badge} data-kind="password">{host.transport === 'https' ? 'HTTPS' : 'HTTP'}</span></td>
+        <td>
+          <span className={css.badge} data-kind="password">{host.transport === 'https' ? 'HTTPS' : 'HTTP'}</span>
+          {host.smbPort !== undefined && host.smbPort !== 445 && <span className={css.cellMuted}> SMB {host.smbPort}</span>}
+        </td>
         <td className={css.cellMuted}>{host.environment ?? ''}</td>
         <td className={css.cellMuted}>{host.tags.join(', ')}</td>
         <td className={css.cellMuted}>{host.description ?? ''}</td>

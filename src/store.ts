@@ -46,6 +46,9 @@ export function validateHostPayload(payload: unknown): string | undefined {
   if (p.rejectUnauthorized !== undefined && typeof p.rejectUnauthorized !== 'boolean') {
     return 'rejectUnauthorized must be a boolean'
   }
+  if (p.smbPort !== undefined && (typeof p.smbPort !== 'number' || !Number.isInteger(p.smbPort) || p.smbPort < 1 || p.smbPort > 65535)) {
+    return 'smbPort must be an integer in 1..65535'
+  }
   if (p.tags !== undefined && (!Array.isArray(p.tags) || p.tags.some(x => typeof x !== 'string'))) {
     return 'tags must be an array of strings'
   }
@@ -95,6 +98,7 @@ export class HostStore {
       auth: entry.auth.kind,
       transport: entry.transport,
       ...(entry.rejectUnauthorized !== undefined ? { rejectUnauthorized: entry.rejectUnauthorized } : {}),
+      ...(entry.smbPort !== undefined ? { smbPort: entry.smbPort } : {}),
       ...(entry.description !== undefined ? { description: entry.description } : {}),
       ...(entry.environment !== undefined ? { environment: entry.environment } : {}),
       tags: [...entry.tags],
@@ -124,6 +128,7 @@ export class HostStore {
       auth: { kind: 'password', password: payload.auth.password },
       transport: payload.transport ?? 'http',
       ...(payload.rejectUnauthorized !== undefined ? { rejectUnauthorized: payload.rejectUnauthorized } : {}),
+      ...(payload.smbPort !== undefined ? { smbPort: payload.smbPort } : {}),
       description: payload.description?.trim() || undefined,
       environment: payload.environment?.trim() || undefined,
       tags: [...(payload.tags ?? [])].map(tag => tag.trim()).filter(tag => tag !== ''),
@@ -153,6 +158,9 @@ export class HostStore {
     if (patch.transport !== undefined && patch.transport !== 'http' && patch.transport !== 'https') {
       throw new Error('transport must be http or https')
     }
+    if (patch.smbPort !== undefined && (typeof patch.smbPort !== 'number' || !Number.isInteger(patch.smbPort) || patch.smbPort < 1 || patch.smbPort > 65535)) {
+      throw new Error('smbPort must be an integer in 1..65535')
+    }
     if (patch.tags !== undefined && (!Array.isArray(patch.tags) || patch.tags.some(x => typeof x !== 'string'))) {
       throw new Error('tags must be an array of strings')
     }
@@ -166,6 +174,7 @@ export class HostStore {
     }
     if (patch.transport !== undefined) entry.transport = patch.transport
     if (patch.rejectUnauthorized !== undefined) entry.rejectUnauthorized = patch.rejectUnauthorized
+    if (patch.smbPort !== undefined) entry.smbPort = patch.smbPort
     if (patch.description !== undefined) entry.description = patch.description.trim() || undefined
     if (patch.environment !== undefined) entry.environment = patch.environment.trim() || undefined
     if (patch.tags !== undefined) entry.tags = [...patch.tags].map(tag => tag.trim()).filter(tag => tag !== '')

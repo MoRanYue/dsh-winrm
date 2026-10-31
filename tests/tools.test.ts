@@ -42,6 +42,7 @@ const FULL_SUMMARY = {
   auth: 'password',
   transport: 'https',
   rejectUnauthorized: false,
+  smbPort: 1445,
   description: 'prod box',
   environment: 'production',
   tags: ['prod', 'cn'],
@@ -71,6 +72,16 @@ function stubEngine(overrides: Record<string, unknown>): never {
 test('winrm_list output schema accepts host summaries with and without optional fields', async () => {
   const tool = winrmListTool(stubEngine({ list: () => [FULL_SUMMARY, MINIMAL_SUMMARY] }))
   assertValidOutput(tool, await tool.execute({}))
+})
+
+test('winrm_list output schema accepts a custom SMB port', async () => {
+  // Regression: smbPort is emitted by HostStore.summarize() whenever the stored
+  // entry sets it, and the tool output schema declares every field with
+  // additionalProperties: false — an undeclared one fails the whole call.
+  const tool = winrmListTool(stubEngine({ list: () => [{ ...MINIMAL_SUMMARY, smbPort: 1445 }] }))
+  const value = await tool.execute({})
+  assertValidOutput(tool, value)
+  assert.equal(value.hosts[0]?.smbPort, 1445)
 })
 
 test('winrm_list output schema accepts rejectUnauthorized explicitly', async () => {

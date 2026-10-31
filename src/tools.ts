@@ -18,17 +18,21 @@ function text(value: string): ContentBlock[] {
 /** Host table render shared by list surfaces. */
 function renderHosts(hosts: WinHostSummary[]): string {
   if (hosts.length === 0) return 'no hosts configured'
+  // The SMB port only earns a column when some host overrides it.
+  const withSmb = hosts.some(host => host.smbPort !== undefined && host.smbPort !== 445)
+  const head = ['alias', 'host', 'port', ...(withSmb ? ['smb'] : []), 'user', 'transport', 'environment', 'tags', 'description']
   const rows = hosts.map(host => [
     host.alias,
     host.host,
     String(host.port),
+    ...(withSmb ? [String(host.smbPort ?? 445)] : []),
     host.user,
     host.transport,
     host.environment ?? '-',
     (host.tags.length > 0 ? host.tags.join(',') : '-'),
     host.description ?? '',
   ].join(' | '))
-  return ['alias | host | port | user | transport | environment | tags | description', '--- | --- | --- | --- | --- | --- | --- | ---', ...rows].join('\n')
+  return [head.join(' | '), head.map(() => '---').join(' | '), ...rows].join('\n')
 }
 
 /** Render one exec result (mirrors the bash-tool exit-code convention). */
@@ -82,6 +86,7 @@ export function winrmListTool(engine: WinRmEngine) {
                 auth: { type: 'string', enum: ['password'], required: true },
                 transport: { type: 'string', enum: ['http', 'https'], required: true },
                 rejectUnauthorized: { type: 'boolean' },
+                smbPort: { type: 'integer' },
                 description: { type: 'string' },
                 environment: { type: 'string' },
                 tags: { type: 'array', items: { type: 'string' }, required: true },
@@ -273,7 +278,7 @@ export function winrmUploadTool(engine: WinRmEngine) {
       alias: { type: 'string', required: true, description: 'Host alias from winrm_list.' },
       localPath: { type: 'string', required: true, description: 'Absolute local file path on this machine.' },
       remotePath: { type: 'string', required: true, description: 'Destination path on the remote host, e.g. C:\\temp\\file.txt (parent dirs are created).' },
-      channel: { type: 'string', enum: ['auto', 'smb', 'winrm'], description: 'Transfer channel: auto (default) uses the SMB admin share when TCP 445 answers and otherwise WinRM; smb fails outright when 445 is closed; winrm always streams over the WinRS stdin channel.' },
+      channel: { type: 'string', enum: ['auto', 'smb', 'winrm'], description: 'Transfer channel: auto (default) uses the SMB admin share when the host\'s SMB port answers and otherwise WinRM; smb fails outright when that port is closed; winrm always streams over the WinRS stdin channel.' },
     },
     output: {
       schema: {
@@ -312,7 +317,7 @@ export function winrmDownloadTool(engine: WinRmEngine) {
       alias: { type: 'string', required: true, description: 'Host alias from winrm_list.' },
       remotePath: { type: 'string', required: true, description: 'Remote file path, e.g. C:\\temp\\file.txt.' },
       localPath: { type: 'string', required: true, description: 'Absolute destination path on this machine.' },
-      channel: { type: 'string', enum: ['auto', 'smb', 'winrm'], description: 'Transfer channel: auto (default) uses the SMB admin share when TCP 445 answers and otherwise WinRM; smb fails outright when 445 is closed; winrm always streams over parallel WinRS byte ranges.' },
+      channel: { type: 'string', enum: ['auto', 'smb', 'winrm'], description: 'Transfer channel: auto (default) uses the SMB admin share when the host\'s SMB port answers and otherwise WinRM; smb fails outright when that port is closed; winrm always streams over parallel WinRS byte ranges.' },
     },
     output: {
       schema: {

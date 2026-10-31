@@ -27,6 +27,7 @@ export function HostFormDialog({ api, editing, onClose, onSaved }: HostFormDialo
   const [password, setPassword] = useState('')
   const [transport, setTransport] = useState<'http' | 'https'>(editing?.transport ?? 'http')
   const [rejectUnauthorized, setRejectUnauthorized] = useState(editing?.rejectUnauthorized ?? false)
+  const [smbPort, setSmbPort] = useState(editing?.smbPort !== undefined ? String(editing.smbPort) : '')
   const [environment, setEnvironment] = useState(editing?.environment ?? '')
   const [tags, setTags] = useState(editing?.tags.join(', ') ?? '')
   const [description, setDescription] = useState(editing?.description ?? '')
@@ -50,6 +51,9 @@ export function HostFormDialog({ api, editing, onClose, onSaved }: HostFormDialo
       user: user.trim(),
       transport,
       rejectUnauthorized,
+      // Empty means "the default port"; sending 445 also clears an old override,
+      // because an omitted field leaves the stored value untouched on update.
+      smbPort: smbPort.trim() === '' ? 445 : Number.parseInt(smbPort, 10),
       environment: environment.trim() || undefined,
       tags: tags.split(',').map(tag => tag.trim()).filter(tag => tag !== ''),
       description: description.trim() || undefined,
@@ -101,6 +105,11 @@ export function HostFormDialog({ api, editing, onClose, onSaved }: HostFormDialo
               </select>
             </label>
           </div>
+          <label className={css.field}>
+            <span className={css.fieldLabel}>{tt('form.smbPort')}</span>
+            <input className={css.input} type="number" value={smbPort} placeholder="445" onChange={event => { setSmbPort(event.target.value) }} />
+            <span className={css.fieldHint}>{tt('form.smbPortHint')}</span>
+          </label>
           <label className={css.field}>
             <span className={css.fieldLabel}>{tt('form.user')}</span>
             <input className={css.input} value={user} onChange={event => { setUser(event.target.value) }} placeholder={tt('form.userHint')} />

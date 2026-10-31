@@ -118,12 +118,27 @@ scripts/
 
 传输依赖原生 Node.js 的 [winrm-client](https://github.com/shide1989/winrm-client)（NTLM/Basic，进程内认证）；密码只在宿主进程内使用，不出现在任何子进程命令行参数中。
 
+### SMB 通道与自定义端口
+
+`channel=smb`/`auto` 的快速路径默认连目标机的 445。主机配置里的「SMB 端口」可以改成别的值，但 Windows **不能**改 SMB 的 TCP 监听端口（[官方文档](https://learn.microsoft.com/zh-cn/windows-server/storage/file-server/smb-ports)只允许改 QUIC 端口），所以非 445 一定意味着目标机前面有转发：
+
+```powershell
+# 目标机：把 1445 转发到本机 445，只对指定来源放行
+netsh interface portproxy add v4tov4 listenport=1445 listenaddress=0.0.0.0 connectport=445 connectaddress=127.0.0.1
+New-NetFirewallRule -DisplayName 'dsh-winrm: SMB 1445' -Direction Inbound -Action Allow `
+  -Protocol TCP -LocalPort 1445 -RemoteAddress <运行 dsh 的机器的出口 IP>
+```
+
+填了非 445 端口后，传输改用 `New-SmbMapping -TcpPort` 把共享挂到空闲盘符（Z 往下找），拷完 `Remove-SmbMapping` 卸掉。`New-SmbMapping` 的 `-TcpPort` 需要**运行 dsh 的这台机器**是 Windows 11 24H2 / Windows Server 2025 或更新版本；凭据经环境变量交给 PowerShell，不进命令行。
+
+
 ## 已知限制
 
 - 控制台是命令会话，不保持 PowerShell 变量和当前目录状态；每条命令独立执行
 - 上传走**单条 stdin 流**：一个 shell、一个命令，每 256KB 一个 `Send`，可压缩内容自动按块 gzip（实测 1.7MB JSON 线上仅 91KB）。旧的 48KB 分块路径保留为回退，仅在流式通道不可用时启用
 - 下载走**并行区间流**：默认最多 4 个 worker，各自一个 shell 读同一文件的绝对字节区间，远端 gzip 后回传，本地按 offset 落位（实测 2MiB 约 10-12 秒，16MiB 约 21-23 秒，可压缩的 16MiB 约 6 秒；旧的 48KB 分块路径 2MiB 需 129 秒，保留为回退）。服务端单次 `Receive` 最多回 128KB，与信封大小无关，所以下载是往返次数受限而非带宽受限
-- `channel=auto`（默认）先探测目标机 445 端口：`net use` 自身没有短超时，SMB 不可用时要等约 60 秒才失败，此前这段等待发生在每次上传之前。现在 3 秒内判定并直接走 WinRM；显式 `channel=smb` 且 445 未开放时立即报错，并提示改用 `winrm`
+- `channel=auto`（默认）先探测目标机的 SMB 端口：`net use` 自身没有短超时，SMB 不可用时要等约 60 秒才失败，此前这段等待发生在每次上传之前。现在 3 秒内判定并直接走 WinRM；显式 `channel=smb` 且端口未开放时立即报错，并提示改用 `winrm`
+- 自定义 SMB 端口（非 445）依赖目标机的端口转发，且运行 dsh 的机器需 Windows 11 24H2 / Server 2025 以上（`New-SmbMapping -TcpPort`）；Windows 不能直接改 SMB 的 TCP 监听端口
 - 流式传输以**字节是否还在流动**判定超时，而不是给整次传输一个固定时限：只要还有数据到达就继续，某条区间连续 180 秒没有任何字节才判失败。因此大文件（实测 700MiB）在该链路的约 0.73MiB/s 速率下会跑十几分钟并正常完成；绝对上限只是防止传输卡死后永久占用，按载荷大小放大
 - 下载失败不留残留文件：已写入的数据会被丢弃、目标文件被删除；若失败发生在任何字节到达之前（路径不存在、目标是目录、主机不可达），已存在的本地文件保持原样不动（目标文件在首次写入时才创建）
 - 一次传输被中途放弃时（例如某次认证尝试失败后从头重试），目标机上的发送进程可能残留并继续占用该文件，直到其 shell 被回收；正常结束的传输会自行退出。遇到远端文件删不掉时，先结束目标机上对应的 `powershell.exe` 发送进程再删

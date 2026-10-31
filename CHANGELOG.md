@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Added
+
+- **A host can name a port other than 445 for SMB.** Windows cannot move the SMB
+  TCP listening port — the documented alternative-port feature only covers QUIC —
+  so in practice a non-445 value means something forwards to 445 in front of the
+  target (`netsh interface portproxy`, typically behind a scoped firewall rule).
+  The host form, the store, `winrm_list` and the SQL-free summary all carry
+  `smbPort`; transfers mount the share with
+  `New-SmbMapping -TcpPort <port>` onto a free drive letter (Z downwards) and
+  unmap afterwards, because `net use` cannot dial a port. `New-SmbMapping
+  -TcpPort` requires Windows 11 24H2 / Windows Server 2025 or newer on the
+  machine running dsh, which is reported as such when the parameter is missing.
+  Credentials reach PowerShell through environment variables rather than the
+  command line.
+
 ### Fixed
 
 - **A large download no longer fails on a fixed ten-minute cap.** Both streaming
@@ -18,8 +33,8 @@
   the closed port but not the alternative, so a 700 MiB download asked for over
   SMB failed with no indication that WinRM would work. It now ends with
   `retry with channel "winrm" to transfer over WinRM instead`, and the `channel`
-  parameter on both tools spells out that `auto` only uses SMB when TCP 445
-  answers while `smb` fails outright.
+  parameter on both tools spells out that `auto` only uses SMB when the host's
+  SMB port answers while `smb` fails outright.
 - **A download reports the file size, not the bytes it happened to write.** The
   count summed every positional write, so an attempt that failed partway and was
   retried reported the sum of both attempts — a 700 MiB file came back as

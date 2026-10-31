@@ -118,12 +118,26 @@ scripts/
 
 Transport relies on the native Node.js [winrm-client](https://github.com/shide1989/winrm-client) (NTLM/Basic, in-process authentication); the password is used only inside the host process and never appears on any child process command line.
 
+### SMB channel and a custom port
+
+The fast `channel=smb` / `channel=auto` path talks to the target's port 445 by default. The host form exposes an "SMB port" field, but Windows **cannot** move the SMB TCP listening port ([the documentation](https://learn.microsoft.com/en-us/windows-server/storage/file-server/smb-ports) only allows alternate QUIC ports), so any other value means something forwards to 445 in front of the target:
+
+```powershell
+# On the target: forward 1445 to the local 445, open only to the dsh machine's egress IP
+netsh interface portproxy add v4tov4 listenport=1445 listenaddress=0.0.0.0 connectport=445 connectaddress=127.0.0.1
+New-NetFirewallRule -DisplayName 'dsh-winrm: SMB 1445' -Direction Inbound -Action Allow `
+  -Protocol TCP -LocalPort 1445 -RemoteAddress <egress IP of the dsh machine>
+```
+
+With a non-445 port the transfer maps the share with `New-SmbMapping -TcpPort` onto a free drive letter (Z downwards), copies, and unmaps. `-TcpPort` needs **the machine running dsh** to be Windows 11 24H2 / Windows Server 2025 or newer; the credentials reach PowerShell through environment variables, not the command line.
+
 ## Known limitations
 
 - The console is a command session: it does not preserve PowerShell variables or the current directory, and every command runs independently
 - Uploads go over **one stdin stream**: a single shell, a single command, one `Send` per 256 KB, with per-chunk gzip for compressible content (a 1.7 MB JSON fixture travels as 91 KB on the wire). The old 48 KB chunked path is kept as a fallback, used only when the streaming channel is unavailable
 - Downloads go over **parallel byte ranges**: up to four workers by default, each with its own shell reading an absolute byte range of the same file, compressed on the remote side and written locally at the matching offset (measured: 2 MiB in about 10-12 s, 16 MiB in about 21-23 s, 16 MiB of compressible content in about 6 s; the old 48 KB chunked path needed 129 s for 2 MiB and remains as a fallback). A single server `Receive` returns at most 128 KB regardless of the envelope size, so downloads are round-trip bound rather than bandwidth bound
-- `channel=auto` (the default) probes port 445 first: `net use` has no short timeout of its own and takes about 60 s to fail when SMB is unavailable, and that wait used to happen before every upload. It is now decided within 3 s and the transfer goes straight over WinRM. An explicit `channel=smb` on a host whose 445 is closed fails immediately and names `winrm` as the way out
+- `channel=auto` (the default) probes the target's SMB port first: `net use` has no short timeout of its own and takes about 60 s to fail when SMB is unavailable, and that wait used to happen before every upload. It is now decided within 3 s and the transfer goes straight over WinRM. An explicit `channel=smb` on a host whose port is closed fails immediately and names `winrm` as the way out
+- A custom SMB port (anything but 445) depends on a forward in front of the target, and the machine running dsh must be Windows 11 24H2 / Windows Server 2025 or newer (`New-SmbMapping -TcpPort`); Windows cannot change the SMB TCP listening port
 - A streaming transfer is bounded by **whether bytes are still moving**, not by a fixed deadline for the whole transfer: it keeps going as long as data arrives, and only a range that delivers nothing for 180 s is treated as stalled. A 700 MiB file therefore completes normally at the ~0.73 MiB/s this link measures even though it takes about sixteen minutes; the absolute cap exists only so a wedged transfer cannot stay alive forever, and it scales with the payload
 - A failed download leaves no residue: bytes already written are discarded and the target file is removed. If the failure happens before any byte arrives (missing path, target is a directory, host unreachable), an existing local file is left untouched — the target file is only created on the first write
 - When an attempt is abandoned mid-transfer (for example a failed auth candidate retried from the start), the sender process on the target can outlive it and keep the file open until its shell is reclaimed; a transfer that finishes normally exits on its own. If a remote file refuses to delete, end the corresponding `powershell.exe` sender on the target first

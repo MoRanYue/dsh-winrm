@@ -26,6 +26,13 @@ export interface WinHostEntry {
   transport: WinTransport
   /** Whether self-signed HTTPS certificates are accepted. */
   rejectUnauthorized?: boolean
+  /**
+   * TCP port the admin share answers on (default 445). Windows cannot change
+   * the SMB listening port, so any other value means something in front of the
+   * host forwards it — the transfer maps the share with `New-SmbMapping
+   * -TcpPort`, which needs Windows 11 24H2 / Server 2025 on THIS machine.
+   */
+  smbPort?: number
   /** Free-form note. */
   description?: string
   /** Deployment environment label (development / production / ...). */
@@ -47,6 +54,7 @@ export interface WinHostSummary {
   auth: 'password'
   transport: WinTransport
   rejectUnauthorized?: boolean
+  smbPort?: number
   description?: string
   environment?: string
   tags: string[]
@@ -195,6 +203,7 @@ export interface WinHostPayload {
   auth?: WinHostEntry['auth']
   transport?: WinTransport
   rejectUnauthorized?: boolean
+  smbPort?: number
   description?: string
   environment?: string
   tags?: string[]
