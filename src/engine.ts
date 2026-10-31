@@ -536,6 +536,7 @@ export class WinRmEngine {
       const report = (transferred: number, total: number): void => {
         onProgress?.({ phase: 'transferring', file: remotePath, transferred, total, percent: total > 0 ? Math.round((transferred / total) * 1000) / 10 : 0 })
       }
+      let delivered = 0
       try {
         const conn = connOf(entry)
         const streamed = await downloadStream(conn, remotePath, put, report)
@@ -551,6 +552,12 @@ export class WinRmEngine {
             },
             report,
           )
+          delivered = bytes
+        } else {
+          // `bytes` counts every positional write, and a retry re-sends the
+          // ranges from their start — so it would report more than the file
+          // holds. The successful attempt's own total is the file size.
+          delivered = streamed
         }
         await queue
         // A zero-byte remote file produces no writes, so the sink is still
@@ -570,8 +577,8 @@ export class WinRmEngine {
         // already truncated that file to nothing.
         if (!completed && sink !== null) await rm(localPath, { force: true }).catch(() => undefined)
       }
-      onProgress?.({ phase: 'done', file: remotePath, transferred: bytes, total: bytes, percent: 100 })
-      return { bytes, channel: 'winrm' }
+      onProgress?.({ phase: 'done', file: remotePath, transferred: delivered, total: delivered, percent: 100 })
+      return { bytes: delivered, channel: 'winrm' }
     })
   }
 

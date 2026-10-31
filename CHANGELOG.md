@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A large download no longer fails on a fixed ten-minute cap.** Both streaming
+  paths bounded themselves with a wall-clock budget for the whole transfer
+  (600 s for downloads and uploads), which a slow link outruns long before the
+  file ends: this transport measures ~0.73 MiB/s against a real target, so a
+  700 MiB file legitimately needs about sixteen minutes and was being aborted at
+  roughly 60 % — the caller saw `WinRM request timed out` and the partial file
+  was deleted. The budget is now a **stall window** (180 s with no bytes
+  arriving) plus an absolute backstop that scales with the payload, so a
+  transfer that keeps moving runs to completion and only a genuinely wedged one
+  is killed. Uploads and downloads share the same rule.
+- **`channel=smb` on a host without SMB now says what to do.** The error named
+  the closed port but not the alternative, so a 700 MiB download asked for over
+  SMB failed with no indication that WinRM would work. It now ends with
+  `retry with channel "winrm" to transfer over WinRM instead`, and the `channel`
+  parameter on both tools spells out that `auto` only uses SMB when TCP 445
+  answers while `smb` fails outright.
+- **A download reports the file size, not the bytes it happened to write.** The
+  count summed every positional write, so an attempt that failed partway and was
+  retried reported the sum of both attempts — a 700 MiB file came back as
+  `855191436` bytes. The successful attempt's own total is what is returned now.
+
 ## 0.4.0 - 2026-10-25
 
 Three agent tools that act on the target's text files, mirroring the harness's own

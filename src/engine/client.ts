@@ -338,6 +338,41 @@ const STREAM_GZIP_MIN_RATIO = 0.85
 const STREAM_SEND_TIMEOUT_MS = 120_000
 
 /**
+ * How long a streaming transfer may deliver nothing before it is treated as
+ * stalled.
+ *
+ * A wall-clock cap on the whole transfer cannot work here: this transport is
+ * latency-bound and measured at ~0.73 MiB/s against a real target, so a 700 MiB
+ * file legitimately needs about sixteen minutes and any smaller fixed cap fails
+ * a transfer that is making steady progress. What a transfer actually needs
+ * bounding against is a *stall* — a range that has stopped producing bytes —
+ * which is what this idle window measures.
+ */
+export const STREAM_IDLE_TIMEOUT_MS = 180_000
+
+/**
+ * Floor used only to size the runaway backstop, never as a throughput target.
+ * Deliberately pessimistic (64 KiB/s): it must not fail a slow link, only a
+ * transfer that is somehow still "busy" hours after it should have finished.
+ */
+const STREAM_MIN_BYTES_PER_SEC = 65_536
+
+/**
+ * Budget for one streaming transfer of `bytes` bytes.
+ *
+ * The idle window is the effective limit; the hard window exists so a wedged
+ * transfer cannot stay alive forever, and it scales with the payload because
+ * the payload is what sets the legitimate duration.
+ * @param bytes - total bytes the transfer must move.
+ * @param idleMs - how long the transfer may go without delivering anything.
+ * @returns the idle window and the absolute backstop, both in milliseconds.
+ */
+export function transferBudget(bytes: number, idleMs = STREAM_IDLE_TIMEOUT_MS): { idleMs: number; hardMs: number } {
+  const optimisticMs = Math.ceil(Math.max(0, bytes) / STREAM_MIN_BYTES_PER_SEC) * 1000
+  return { idleMs, hardMs: Math.max(idleMs * 4, optimisticMs + idleMs) }
+}
+
+/**
  * One streaming transfer over a single shell: create → run the receiver →
  * push the receiver script, the header frame and every data frame down stdin →
  * receive the envelope → delete the shell.
@@ -349,7 +384,7 @@ const STREAM_SEND_TIMEOUT_MS = 120_000
  * @param remotePath - destination path on the target.
  * @param data - the file contents to send.
  * @param onProgress - called with cumulative bytes after each frame.
- * @param timeoutMs - whole-transfer budget.
+ * @param budget - idle window and absolute backstop for the transfer.
  * @param authMethod - the auth scheme for this attempt.
  * @param sendHttp - the resolved library send function.
  * @returns the number of file bytes the receiver acknowledged writing.
@@ -360,7 +395,7 @@ async function streamOnce(
   remotePath: string,
   data: Buffer,
   onProgress: ((transferred: number, total: number) => void) | undefined,
-  timeoutMs: number,
+  budget: { idleMs: number; hardMs: number },
   authMethod: WinrmAuth,
   sendHttp: ReturnType<typeof loadSendHttp> & object,
 ): Promise<number> {
@@ -375,7 +410,12 @@ async function streamOnce(
     useHttps: conn.useHttps ?? false,
     rejectUnauthorized: conn.rejectUnauthorized ?? true,
   }
-  const hardDeadline = Date.now() + timeoutMs + SETUP_GRACE_MS
+  const hardDeadline = Date.now() + budget.hardMs + SETUP_GRACE_MS
+  // Progress is what keeps a transfer alive: the send loop and the final
+  // receive loop both refresh this, and only a window with no progress at all
+  // is treated as a stall.
+  let lastProgressAt = Date.now()
+  const stalled = (): boolean => Date.now() - lastProgressAt >= budget.idleMs
   const state = { shellId: undefined as string | undefined, timedOut: false, settled: false }
   const total = data.length
 
@@ -405,7 +445,7 @@ async function streamOnce(
     let slice = STREAM_CHUNK_BYTES
     let ceiling = STREAM_CHUNK_BYTES
     while (offset < total) {
-      if (state.settled || Date.now() >= hardDeadline) throw new WinrmTimedOut()
+      if (state.settled || stalled()) throw new WinrmTimedOut()
       const take = Math.min(slice, total - offset)
       const chunk = data.subarray(offset, offset + take)
       const gz = gzipSync(chunk, { level: 6 })
@@ -422,6 +462,7 @@ async function streamOnce(
         throw error
       }
       offset += take
+      lastProgressAt = Date.now()
       onProgress?.(offset, total)
       if (slice < ceiling) slice = Math.min(ceiling, slice * 2)
     }
@@ -429,15 +470,15 @@ async function streamOnce(
     // 4. The receiver stops on its own once the declared byte count lands, so
     //    there is nothing to close — just wait for its envelope.
     const receive = { ...base, shellId, commandId }
-    const commandDeadline = Date.now() + timeoutMs
     let stdout = ''
     let stderr = ''
     for (;;) {
-      if (state.settled || Date.now() >= commandDeadline) throw new WinrmTimedOut()
+      if (state.settled || stalled()) throw new WinrmTimedOut()
       const chunk = await Command.doReceiveOutputNonBlocking(receive)
       stdout += chunk.output
       stderr += chunk.stderr
       if (chunk.isComplete) break
+      if (chunk.output !== '' || chunk.stderr !== '') lastProgressAt = Date.now()
     }
 
     const parsed = parseEnvelope(stdout)
@@ -488,7 +529,7 @@ async function streamOnce(
  * @param remotePath - destination path on the target.
  * @param data - the file contents to send.
  * @param onProgress - called with cumulative bytes after each frame.
- * @param timeoutMs - whole-transfer budget.
+ * @param idleMs - how long the transfer may go without moving a slice.
  * @returns bytes written, or null when the streaming path is unavailable.
  */
 export async function uploadStream(
@@ -496,15 +537,16 @@ export async function uploadStream(
   remotePath: string,
   data: Buffer,
   onProgress?: (transferred: number, total: number) => void,
-  timeoutMs = 600_000,
+  idleMs = STREAM_IDLE_TIMEOUT_MS,
 ): Promise<number | null> {
   const sendHttp = loadSendHttp()
   if (sendHttp === null) return null
+  const budget = transferBudget(data.length, idleMs)
   const candidates: WinrmAuth[] = conn.useHttps ? ['basic', 'ntlm'] : ['ntlm', 'basic']
   let lastError: unknown
   for (const authMethod of candidates) {
     try {
-      return await streamOnce(conn, remotePath, data, onProgress, timeoutMs, authMethod, sendHttp)
+      return await streamOnce(conn, remotePath, data, onProgress, budget, authMethod, sendHttp)
     } catch (error) {
       if (error instanceof WinrmTimedOut) throw error
       lastError = error
@@ -527,7 +569,7 @@ const DOWNLOAD_RECEIVE_TIMEOUT_MS = 120_000
  * @param start - first byte offset of this worker's range.
  * @param length - bytes this worker must deliver.
  * @param onData - receives each decompressed piece together with its file offset.
- * @param timeoutMs - budget for the whole range.
+ * @param budget - idle window and absolute backstop for this worker's range.
  * @param authMethod - the auth scheme for this attempt.
  * @param sendHttp - the resolved library HTTP function.
  * @returns the number of file bytes this worker delivered.
@@ -538,7 +580,7 @@ async function downloadWorkerOnce(
   start: number,
   length: number,
   onData: (offset: number, data: Buffer) => void,
-  timeoutMs: number,
+  budget: { idleMs: number; hardMs: number },
   authMethod: WinrmAuth,
   sendHttp: ReturnType<typeof loadSendHttp> & object,
 ): Promise<number> {
@@ -553,7 +595,12 @@ async function downloadWorkerOnce(
     useHttps: conn.useHttps ?? false,
     rejectUnauthorized: conn.rejectUnauthorized ?? true,
   }
-  const hardDeadline = Date.now() + timeoutMs + SETUP_GRACE_MS
+  const hardDeadline = Date.now() + budget.hardMs + SETUP_GRACE_MS
+  // Same rule as the upload path: bytes arriving keep the worker alive, and
+  // only a window with no bytes at all counts as a stall. A flat whole-transfer
+  // cap would fail a large file on a slow link even while it is moving.
+  let lastDataAt = Date.now()
+  const stalled = (): boolean => Date.now() - lastDataAt >= budget.idleMs
   const state = { shellId: undefined as string | undefined, timedOut: false, settled: false }
 
   const inner = async (): Promise<number> => {
@@ -589,7 +636,7 @@ async function downloadWorkerOnce(
       // A worker that lost the deadline race keeps running in the background
       // unless it checks; without this it would go on fetching and pushing
       // bytes into a file the caller has already given up on.
-      if (state.settled || Date.now() >= hardDeadline) throw new WinrmTimedOut()
+      if (state.settled || stalled()) throw new WinrmTimedOut()
       const result = await receiveOutput(target, shellId, commandId, sendHttp, DOWNLOAD_RECEIVE_TIMEOUT_MS)
       let sawData = false
       for (const stream of result.streams) {
@@ -605,6 +652,7 @@ async function downloadWorkerOnce(
           stderr += stream.data.toString('utf8')
         }
       }
+      if (sawData) lastDataAt = Date.now()
       if (inflateError !== undefined) throw inflateError
       if (result.exitCode !== undefined) exitCode = result.exitCode
       // A finished command whose final response carried nothing means the
@@ -663,7 +711,7 @@ async function downloadWorkerOnce(
  * @param remotePath - file to read.
  * @param onData - receives each decompressed piece with its absolute file offset.
  * @param onProgress - receives cumulative bytes delivered and the total size.
- * @param timeoutMs - budget for the whole download.
+ * @param idleMs - how long a worker may go without delivering bytes.
  * @returns the number of bytes delivered, or null when streaming is unavailable.
  */
 export async function downloadStream(
@@ -671,13 +719,15 @@ export async function downloadStream(
   remotePath: string,
   onData: (offset: number, data: Buffer) => void,
   onProgress?: (transferred: number, total: number) => void,
-  timeoutMs = 600_000,
+  idleMs = STREAM_IDLE_TIMEOUT_MS,
 ): Promise<number | null> {
   const sendHttp = loadSendHttp()
   if (sendHttp === null) return null
   const total = await remoteFileSize(conn, remotePath)
   if (total === null) throw new Error(`remote file not found: ${remotePath}`)
   if (total === 0) return 0
+  // The payload size, not a constant, is what sets a legitimate duration here.
+  const budget = transferBudget(total, idleMs)
   const workers = Math.max(1, Math.min(DOWNLOAD_MAX_WORKERS, Math.ceil(total / DOWNLOAD_MIN_RANGE_BYTES)))
   const rangeSize = Math.ceil(total / workers)
   let transferred = 0
@@ -708,7 +758,7 @@ export async function downloadStream(
         }
         await Promise.all(
           ranges.map(range =>
-            downloadWorkerOnce(conn, remotePath, range.start, range.length, report, timeoutMs, authMethod, sendHttp),
+            downloadWorkerOnce(conn, remotePath, range.start, range.length, report, budget, authMethod, sendHttp),
           ),
         )
         return transferred

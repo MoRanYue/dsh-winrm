@@ -134,7 +134,10 @@ export async function smbReachable(host: string): Promise<boolean> {
 
 /** Error thrown when SMB was requested or probed and the target is not listening. */
 export function smbUnavailable(host: string): Error {
-  return new Error('SMB is not reachable on ' + host + ':445 (the admin share needs TCP 445 open and the Server service running)')
+  return new Error(
+    'SMB is not reachable on ' + host + ':445 (the admin share needs TCP 445 open and the Server service running); '
+    + 'retry with channel "winrm" to transfer over WinRM instead',
+  )
 }
 
 /**

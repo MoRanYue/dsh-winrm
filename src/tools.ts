@@ -273,7 +273,7 @@ export function winrmUploadTool(engine: WinRmEngine) {
       alias: { type: 'string', required: true, description: 'Host alias from winrm_list.' },
       localPath: { type: 'string', required: true, description: 'Absolute local file path on this machine.' },
       remotePath: { type: 'string', required: true, description: 'Destination path on the remote host, e.g. C:\\temp\\file.txt (parent dirs are created).' },
-      channel: { type: 'string', enum: ['auto', 'smb', 'winrm'], description: 'Transfer channel: smb (admin share), winrm (streamed over the WinRS stdin channel), or auto (default, SMB first with WinRM fallback).' },
+      channel: { type: 'string', enum: ['auto', 'smb', 'winrm'], description: 'Transfer channel: auto (default) uses the SMB admin share when TCP 445 answers and otherwise WinRM; smb fails outright when 445 is closed; winrm always streams over the WinRS stdin channel.' },
     },
     output: {
       schema: {
@@ -306,13 +306,13 @@ export function winrmUploadTool(engine: WinRmEngine) {
 export function winrmDownloadTool(engine: WinRmEngine) {
   return defineTool({
     name: 'winrm_download',
-    description: 'Download a remote FILE from a configured Windows host to a local path on this machine. The bytes come over the SMB admin share when it is reachable, otherwise they are streamed over WinRM as parallel byte ranges (the 48 KiB base64 chunk path is kept only as a fallback). Directory download is not supported — download files individually. ' +
+    description: 'Download a remote FILE from a configured Windows host to a local path on this machine. The bytes come over the SMB admin share when it is reachable, otherwise they are streamed over WinRM as parallel byte ranges (the 48 KiB base64 chunk path is kept only as a fallback). Large files are fine: the WinRM path runs for as long as bytes keep arriving and only fails once a range stalls. Directory download is not supported — download files individually. ' +
       'Triggers: download file from Windows server, fetch remote log/artifact.',
     parameters: {
       alias: { type: 'string', required: true, description: 'Host alias from winrm_list.' },
       remotePath: { type: 'string', required: true, description: 'Remote file path, e.g. C:\\temp\\file.txt.' },
       localPath: { type: 'string', required: true, description: 'Absolute destination path on this machine.' },
-      channel: { type: 'string', enum: ['auto', 'smb', 'winrm'], description: 'Transfer channel: smb (admin share), winrm (streamed over parallel WinRS ranges), or auto (default, SMB first with WinRM fallback).' },
+      channel: { type: 'string', enum: ['auto', 'smb', 'winrm'], description: 'Transfer channel: auto (default) uses the SMB admin share when TCP 445 answers and otherwise WinRM; smb fails outright when 445 is closed; winrm always streams over parallel WinRS byte ranges.' },
     },
     output: {
       schema: {
